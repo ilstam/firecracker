@@ -11,9 +11,11 @@ use vmm::rpc_interface::{VmmAction, VmmActionError, VmmData};
 
 use super::ApiServer;
 use super::request::actions::parse_put_actions;
+use super::request::attach::parse_put_attach;
 use super::request::balloon::{parse_get_balloon, parse_patch_balloon, parse_put_balloon};
 use super::request::boot_source::parse_put_boot_source;
 use super::request::cpu_configuration::parse_put_cpu_config;
+use super::request::detach::parse_put_detach;
 use super::request::drive::{parse_patch_drive, parse_put_drive};
 use super::request::entropy::parse_put_entropy;
 use super::request::instance_info::parse_get_instance_info;
@@ -112,6 +114,8 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {
                 parse_put_memory_hotplug(body)
             }
+            (Method::Put, "detach", None) => parse_put_detach(),
+            (Method::Put, "attach", None) => parse_put_attach(),
             (Method::Put, _, None) => method_to_error(Method::Put),
             (Method::Patch, "balloon", body) => parse_patch_balloon(body, path_tokens),
             (Method::Patch, "drives", Some(body)) => parse_patch_drive(body, path_tokens.next()),

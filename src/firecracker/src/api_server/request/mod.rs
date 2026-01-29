@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod actions;
+pub mod attach;
 pub mod balloon;
 pub mod boot_source;
 pub mod cpu_configuration;
+pub mod detach;
 pub mod drive;
 pub mod entropy;
 pub mod hotplug;

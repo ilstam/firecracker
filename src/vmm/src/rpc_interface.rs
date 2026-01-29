@@ -146,6 +146,10 @@ pub enum VmmAction {
     /// Update the microVM configuration (memory & vcpu) using `VmUpdateConfig` as input. This
     /// action can only be called before the microVM has booted.
     UpdateMachineConfiguration(MachineConfigUpdate),
+    /// Attach API
+    Attach,
+    /// Detach API
+    Detach,
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -495,7 +499,9 @@ impl<'a> PrebootApiController<'a> {
             | UpdateNetworkInterface(_)
             | StartFreePageHinting(_)
             | GetFreePageHintingStatus
-            | StopFreePageHinting => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | StopFreePageHinting
+            | Attach
+            | Detach => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -731,6 +737,16 @@ impl RuntimeApiController {
             GetVmmVersion => Ok(VmmData::VmmVersion(
                 self.vmm.lock().expect("Poisoned lock").version(),
             )),
+            Attach => {
+                info!("ATTACH START");
+                info!("ATTACH END");
+                Ok(VmmData::Empty)
+            }
+            Detach => {
+                info!("DETACH START");
+                info!("DETACH END");
+                Ok(VmmData::Empty)
+            }
             PatchMMDS(value) => mmds_patch_data(
                 self.vmm
                     .lock()
