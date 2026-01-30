@@ -124,7 +124,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use device_manager::DeviceManager;
-use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
+use event_manager::{
+    EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber, SubscriberOps,
+};
 use seccomp::BpfProgram;
 use snapshot::Persist;
 use userfaultfd::Uffd;
@@ -155,6 +157,7 @@ use crate::rate_limiter::BucketUpdate;
 use crate::resources::VmmConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
+use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vmm_config::entropy::EntropyDeviceConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
@@ -335,6 +338,108 @@ impl Vmm {
     /// Gets Vmm version.
     pub fn version(&self) -> String {
         self.instance_info.vmm_version.clone()
+    }
+
+    /// Attach doc
+    pub fn attach_device(&mut self, event_manager: &mut EventManager) {
+        info!("INSIDE ATTACH");
+        let json = format!(
+            r#"{{
+  "drive_id": "secondary",
+  "partuuid": null,
+  "is_root_device": false,
+  "cache_type": "Unsafe",
+  "is_read_only": false,
+  "path_on_host": "/home/ANT.AMAZON.COM/ilstam/fc-bins/secondary.ext4",
+  "io_engine": "Sync",
+  "rate_limiter": null,
+  "socket": null
+}}
+"#
+        );
+        let config = serde_json::from_str::<BlockDeviceConfig>(json.as_str()).unwrap();
+        let block = Arc::new(Mutex::new(Block::new(config).unwrap()));
+        self.device_manager
+            .pci_devices
+            .attach_pci_virtio_device(&self.vm, "secondary".to_string(), block, event_manager)
+            .unwrap();
+    }
+
+    /// doc
+    pub fn detach_device(&mut self, event_manager: &mut EventManager) {
+        let mut sub_id = None;
+
+        for ((device_type, name), mmio_device) in &self.device_manager.mmio_devices.virtio_devices {
+            if *device_type == VirtioDeviceType::Net {
+                info!("Unplugging {name}");
+                sub_id = mmio_device.sub_id;
+                let base = mmio_device.resources.addr;
+                let len = mmio_device.resources.len;
+                self.vm.common.mmio_bus.remove(base, len).unwrap();
+            }
+        }
+        if !sub_id.is_none() {
+            info!("REMOVED FROM MMIO BUS");
+        }
+
+        let mut num_bdf = None;
+        let mut sub_id = None;
+        for ((device_type, name), pci_device) in &self.device_manager.pci_devices.virtio_devices {
+            if *device_type == VirtioDeviceType::Net {
+                info!("Unplugging {name}");
+                sub_id = pci_device.lock().unwrap().sub_id;
+                let base = pci_device.lock().unwrap().bar_address;
+                let len = 0x80000; // there is a constant for this
+                num_bdf = Some(pci_device.lock().unwrap().pci_device_bdf.device() as u32);
+                self.vm.common.mmio_bus.remove(base, len).unwrap();
+            }
+        }
+        if !sub_id.is_none() {
+            info!("REMOVED FROM PCI BUS");
+        }
+
+        event_manager.remove_subscriber(sub_id.unwrap()).unwrap();
+        info!("REMOVED FROM EVENT MANAGER");
+
+        if let Some(_) = self
+            .device_manager
+            .mmio_devices
+            .virtio_devices
+            .remove(&(VirtioDeviceType::Net, "my_network0".to_string()))
+        {
+            info!("REMOVED FROM MMIO DEVICE MANAGER");
+        } else {
+            info!("DIDn't find in MMIO DEVICE MANAGER");
+        }
+
+        if let Some(_) = self
+            .device_manager
+            .pci_devices
+            .virtio_devices
+            .remove(&(VirtioDeviceType::Net, "my_network0".to_string()))
+        {
+            info!("REMOVED FROM PCI DEVICE MANAGER");
+        } else {
+            info!("DIDn't find in PCI DEVICE MANAGER");
+        }
+
+        info!("NUM BDF is {}", num_bdf.unwrap());
+        if let Some(_) = self
+            .device_manager
+            .pci_devices
+            .pci_segment
+            .as_mut()
+            .unwrap()
+            .pci_bus
+            .lock()
+            .unwrap()
+            .devices
+            .remove(&num_bdf.unwrap())
+        {
+            info!("REMOVED FROM BDF DEVICE MANAGER");
+        } else {
+            info!("DIDn't find in BDF DEVICE MANAGER");
+        }
     }
 
     /// Gets Vmm instance info.

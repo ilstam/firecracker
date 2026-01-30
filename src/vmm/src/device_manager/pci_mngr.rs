@@ -7,7 +7,7 @@ use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
 use super::persist::MmdsState;
@@ -148,7 +148,10 @@ impl PciDevices {
         // We should only be reaching this point if PCI is enabled
         let pci_segment = self.pci_segment.as_ref().unwrap();
         let pci_device_bdf = pci_segment.next_device_bdf()?;
-        debug!("Allocating BDF: {pci_device_bdf:?} for device");
+        info!(
+            "Allocating BDF: {pci_device_bdf:?} for device {}",
+            id.clone()
+        );
         let mem = vm.guest_memory().clone();
 
         let device_type = device.lock().expect("Poisoned lock").device_type();

@@ -229,6 +229,12 @@ impl RxBuffers {
     }
 }
 
+impl Drop for Net {
+    fn drop(&mut self) {
+        log::info!("NET is DESTROYED!!!");
+    }
+}
+
 /// VirtIO network device.
 ///
 /// It emulates a network device able to exchange L2 frames between the guest

@@ -683,7 +683,7 @@ impl RuntimeApiController {
     pub fn handle_request(
         &mut self,
         request: VmmAction,
-        _event_manager: &mut EventManager,
+        event_manager: &mut EventManager,
     ) -> Result<VmmData, VmmActionError> {
         use self::VmmAction::*;
         match request {
@@ -739,11 +739,19 @@ impl RuntimeApiController {
             )),
             Attach => {
                 info!("ATTACH START");
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .attach_device(event_manager);
                 info!("ATTACH END");
                 Ok(VmmData::Empty)
             }
             Detach => {
                 info!("DETACH START");
+                self.vmm
+                    .lock()
+                    .expect("Poisoned lock")
+                    .detach_device(event_manager);
                 info!("DETACH END");
                 Ok(VmmData::Empty)
             }

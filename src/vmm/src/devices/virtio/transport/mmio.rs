@@ -64,6 +64,12 @@ pub struct MmioTransport {
     pub is_vhost_user: bool,
 }
 
+impl Drop for MmioTransport {
+    fn drop(&mut self) {
+        log::info!("MmioTransport is DESTROYED");
+    }
+}
+
 impl MmioTransport {
     /// Constructs a new MMIO transport for the given virtio device.
     pub fn new(

@@ -262,7 +262,7 @@ pub struct VirtioPciDevice {
     pub sub_id: Option<event_manager::SubscriberId>,
 
     // BDF assigned to the device
-    pci_device_bdf: PciBdf,
+    pub pci_device_bdf: PciBdf,
 
     // PCI configuration registers.
     configuration: PciConfiguration,
