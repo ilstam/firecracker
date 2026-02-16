@@ -6,7 +6,7 @@
 use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex};
 
-use event_manager::{MutEventSubscriber, SubscriberOps};
+use event_manager::SubscriberOps;
 use log::warn;
 use serde::{Deserialize, Serialize};
 
@@ -336,7 +336,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
         let mut restore_helper = |device: Arc<Mutex<dyn VirtioDevice>>,
                                   activated: bool,
                                   is_vhost_user: bool,
-                                  as_subscriber: Arc<Mutex<dyn MutEventSubscriber>>,
                                   id: &String,
                                   state: &MmioTransportState,
                                   device_info: &MMIODeviceInfo,
@@ -370,7 +369,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     .activate(mem.clone(), interrupt)?;
             }
 
-            event_manager.add_subscriber(as_subscriber);
+            event_manager.add_subscriber(device);
             Ok(())
         };
 
@@ -389,7 +388,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 device.clone(),
                 balloon_state.device_state.virtio_state.activated,
                 false,
-                device,
                 &balloon_state.device_id,
                 &balloon_state.transport_state,
                 &balloon_state.device_info,
@@ -412,7 +410,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 device.clone(),
                 block_state.device_state.is_activated(),
                 false,
-                device,
                 &block_state.device_id,
                 &block_state.transport_state,
                 &block_state.device_info,
@@ -452,7 +449,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 device.clone(),
                 net_state.device_state.virtio_state.activated,
                 false,
-                device,
                 &net_state.device_id,
                 &net_state.transport_state,
                 &net_state.device_info,
@@ -482,7 +478,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 device.clone(),
                 vsock_state.device_state.frontend.virtio_state.activated,
                 false,
-                device,
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
                 &vsock_state.device_info,
@@ -507,7 +502,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 device.clone(),
                 entropy_state.device_state.virtio_state.activated,
                 false,
-                device,
                 &entropy_state.device_id,
                 &entropy_state.transport_state,
                 &entropy_state.device_info,
@@ -533,7 +527,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 device.clone(),
                 pmem_state.device_state.virtio_state.activated,
                 false,
-                device,
                 &pmem_state.device_id,
                 &pmem_state.transport_state,
                 &pmem_state.device_info,
@@ -557,7 +550,6 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 arcd_device.clone(),
                 memory_state.device_state.virtio_state.activated,
                 false,
-                arcd_device,
                 &memory_state.device_id,
                 &memory_state.transport_state,
                 &memory_state.device_info,
