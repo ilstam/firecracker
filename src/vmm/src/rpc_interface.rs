@@ -674,7 +674,11 @@ pub struct RuntimeApiController {
 
 impl RuntimeApiController {
     /// Handles the incoming runtime `VmmAction` request and provides a response for it.
-    pub fn handle_request(&mut self, request: VmmAction) -> Result<VmmData, VmmActionError> {
+    pub fn handle_request(
+        &mut self,
+        request: VmmAction,
+        _event_manager: &mut EventManager,
+    ) -> Result<VmmData, VmmActionError> {
         use self::VmmAction::*;
         match request {
             // Supported operations allowed post-boot.
