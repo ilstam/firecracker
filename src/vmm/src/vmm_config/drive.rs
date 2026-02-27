@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::RateLimiterConfig;
 use crate::VmmError;
+use crate::device_manager::pci_mngr::PciManagerError;
 use crate::devices::virtio::block::device::Block;
 pub use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::{BlockError, CacheType};
@@ -25,6 +26,10 @@ pub enum DriveError {
     CreateRateLimiter(io::Error),
     /// Unable to patch the block device: {0} Please verify the request arguments.
     DeviceUpdate(VmmError),
+    /// Cannot attach device to the PCIe bus
+    PciAttach(#[from] PciManagerError),
+    /// The device ID is already used for a different device
+    DeviceIdInUse,
     /// A root block device already exists!
     RootBlockDeviceAlreadyAdded,
 }

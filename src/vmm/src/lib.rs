@@ -157,7 +157,7 @@ use crate::rate_limiter::BucketUpdate;
 use crate::resources::VmmConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
-use crate::vmm_config::drive::BlockDeviceConfig;
+use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
 use crate::vmm_config::entropy::EntropyDeviceConfig;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
@@ -891,6 +891,36 @@ impl Vmm {
     #[cfg(feature = "gdb")]
     pub fn vm(&self) -> &Vm {
         &self.vm
+    }
+
+    /// Doc
+    pub fn hotplug_block(
+        &mut self,
+        config: BlockDeviceConfig,
+        event_manager: &mut EventManager,
+    ) -> Result<(), DriveError> {
+        for ((device_type, id), _) in &self.device_manager.pci_devices.virtio_devices {
+            if *device_type == VirtioDeviceType::Block && *id == config.drive_id {
+                return Err(DriveError::DeviceIdInUse);
+            }
+        }
+
+        if config.is_root_device {
+            return Err(DriveError::RootBlockDeviceAlreadyAdded);
+        }
+
+        let string_id = config.drive_id.clone();
+        let block = Arc::new(Mutex::new(
+            Block::new(config).map_err(DriveError::CreateBlockDevice)?,
+        ));
+
+        self.device_manager.pci_devices.attach_pci_virtio_device(
+            &self.vm,
+            string_id,
+            block,
+            event_manager,
+        )?;
+        Ok(())
     }
 }
 

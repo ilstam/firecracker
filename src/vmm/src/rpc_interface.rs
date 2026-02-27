@@ -765,6 +765,13 @@ impl RuntimeApiController {
                     .expect("Poisoned lock"),
                 value,
             ),
+            InsertBlockDevice(config) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .hotplug_block(config, event_manager)
+                .map(|()| VmmData::Empty)
+                .map_err(VmmActionError::DriveConfig),
             Pause => self.pause(),
             PutMMDS(value) => mmds_put_data(
                 self.vmm
@@ -828,7 +835,6 @@ impl RuntimeApiController {
             | ConfigureLogger(_)
             | ConfigureMetrics(_)
             | ConfigureSerial(_)
-            | InsertBlockDevice(_)
             | InsertPmemDevice(_)
             | InsertNetworkDevice(_)
             | LoadSnapshot(_)
