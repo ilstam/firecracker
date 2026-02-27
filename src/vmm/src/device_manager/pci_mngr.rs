@@ -36,8 +36,13 @@ use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::pci::PciSBDF;
 use crate::pci::bus::PciRootError;
 use crate::resources::VmResources;
+use crate::rpc_interface::VmmActionError;
 use crate::snapshot::Persist;
+use crate::vmm_config::HotplugDeviceConfig;
+use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
+use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
+use crate::vmm_config::pmem::{PmemConfig, PmemConfigError};
 use crate::vstate::bus::BusError;
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -136,13 +141,11 @@ impl PciDevices {
         Ok(())
     }
 
-    pub(crate) fn attach_pci_virtio_device<
-        T: 'static + VirtioDevice + MutEventSubscriber + Debug,
-    >(
+    pub(crate) fn attach_pci_virtio_device(
         &mut self,
         vm: &Arc<Vm>,
         id: String,
-        device: Arc<Mutex<T>>,
+        device: Arc<Mutex<dyn VirtioDevice>>,
         event_manager: &mut EventManager,
     ) -> Result<(), PciManagerError> {
         // We should only be reaching this point if PCI is enabled
@@ -219,6 +222,84 @@ impl PciDevices {
             let device = device_arc.lock().expect("Poisoned lock");
             f(*device_type, &*device);
         }
+    }
+
+    /// Attaches a device after VM start
+    pub fn hotplug_device(
+        &mut self,
+        vm: &Arc<Vm>,
+        config: HotplugDeviceConfig,
+        event_manager: &mut EventManager,
+    ) -> Result<(), VmmActionError> {
+        if self.pci_segment.is_none() {
+            return Err(VmmActionError::PciNotEnabled);
+        }
+
+        let dev_type = config.device_type();
+        let dev_id = config.device_id().to_string();
+
+        if self
+            .virtio_devices
+            .contains_key(&(dev_type, dev_id.clone()))
+        {
+            return Err(VmmActionError::DeviceIdInUse);
+        }
+
+        let device = match config {
+            HotplugDeviceConfig::Block(cfg) => Self::hotplug_make_block(cfg)?,
+            HotplugDeviceConfig::Pmem(cfg) => Self::hotplug_make_pmem(vm, cfg)?,
+            HotplugDeviceConfig::Net(cfg) => self.hotplug_make_net(cfg)?,
+        };
+
+        self.attach_pci_virtio_device(vm, dev_id, device, event_manager)?;
+        Ok(())
+    }
+
+    fn hotplug_make_block(
+        config: BlockDeviceConfig,
+    ) -> Result<Arc<Mutex<dyn VirtioDevice>>, VmmActionError> {
+        if config.is_root_device {
+            return Err(DriveError::RootBlockDeviceAlreadyAdded.into());
+        }
+
+        let block = Block::new(config).map_err(DriveError::CreateBlockDevice)?;
+        Ok(Arc::new(Mutex::new(block)))
+    }
+
+    fn hotplug_make_pmem(
+        vm: &Arc<Vm>,
+        config: PmemConfig,
+    ) -> Result<Arc<Mutex<dyn VirtioDevice>>, VmmActionError> {
+        if config.root_device {
+            return Err(PmemConfigError::AddingSecondRootDevice.into());
+        }
+
+        let mut pmem = Pmem::new(config).map_err(PmemConfigError::from)?;
+        pmem.alloc_region(vm.as_ref()).unwrap();
+        pmem.set_mem_region(vm.as_ref())
+            .map_err(PmemConfigError::from)?;
+
+        Ok(Arc::new(Mutex::new(pmem)))
+    }
+
+    fn hotplug_make_net(
+        &self,
+        config: NetworkInterfaceConfig,
+    ) -> Result<Arc<Mutex<dyn VirtioDevice>>, VmmActionError> {
+        if let Some(mac) = config.guest_mac {
+            for device in self.virtio_devices.values() {
+                let device = device.lock().expect("Poisoned lock").virtio_device();
+                let device = device.lock().expect("Poisoned lock");
+                if let Some(net) = device.as_any().downcast_ref::<Net>()
+                    && net.guest_mac() == Some(&mac)
+                {
+                    return Err(NetworkInterfaceError::GuestMacAddressInUse(mac.to_string()).into());
+                }
+            }
+        }
+
+        let net = NetBuilder::create_net(config)?;
+        Ok(Arc::new(Mutex::new(net)))
     }
 }
 
