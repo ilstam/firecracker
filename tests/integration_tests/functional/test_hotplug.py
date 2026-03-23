@@ -1,0 +1,283 @@
+# Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for PCI device hotplug"""
+
+import os
+
+import pytest
+
+import host_tools.drive as drive_tools
+import host_tools.network as net_tools
+
+VIRTIO_PCI_VENDOR_ID = 0x1AF4
+VIRTIO_PCI_DEVICE_ID_NET = 0x1041
+VIRTIO_PCI_DEVICE_ID_BLOCK = 0x1042
+VIRTIO_PCI_DEVICE_ID_PMEM = 0x105B
+
+
+def test_hotplug_block(microvm_factory, guest_kernel_acpi, rootfs):
+    """
+    Test hotplugging a block device after VM start.
+    Test that the device appears in lspci and is usable.
+    Test that invalid hotplug request are rejected.
+    """
+    vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=True)
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+    vm.start()
+
+    # Snapshot lspci output before hotplug
+    _, lspci_before, _ = vm.ssh.check_output("lspci -n")
+
+    # Hotplug a block device
+    host_file = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "block0"), size=4)
+    vm.api.drive.put(
+        drive_id="block0",
+        path_on_host=vm.create_jailed_resource(host_file.path),
+        is_root_device=False,
+        is_read_only=False,
+    )
+
+    # Rescan PCI bus since no hotplug notification mechanism exists yet
+    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+
+    # Verify a new virtio-block device entry appeared in lspci
+    _, lspci_after, _ = vm.ssh.check_output("lspci -n")
+    new_entries = set(lspci_after.splitlines()) - set(lspci_before.splitlines())
+    assert len(new_entries) == 1
+    entry = new_entries.pop()
+    assert f"{VIRTIO_PCI_VENDOR_ID:04x}:{VIRTIO_PCI_DEVICE_ID_BLOCK:04x}" in entry
+
+    # Discover the block device node from the PCI BDF via sysfs
+    bdf = entry.split()[0]
+    _, dev_name, _ = vm.ssh.check_output(
+        f"ls /sys/bus/pci/devices/0000:{bdf}/virtio*/block/"
+    )
+    dev_path = f"/dev/{dev_name.strip()}"
+
+    # Ensure the device is usable by writing a file to it and reading it back
+    vm.ssh.check_output("mkdir -p /tmp/block0_mnt")
+    vm.ssh.check_output(f"mount {dev_path} /tmp/block0_mnt")
+    vm.ssh.check_output("echo hotplug_test > /tmp/block0_mnt/test")
+    _, stdout, _ = vm.ssh.check_output("cat /tmp/block0_mnt/test")
+    assert stdout.strip() == "hotplug_test"
+
+    # Hotplugging a device with a duplicate ID must be rejected
+    with pytest.raises(RuntimeError, match="Device ID in use"):
+        vm.api.drive.put(
+            drive_id="block0",
+            path_on_host=vm.create_jailed_resource(host_file.path),
+            is_root_device=False,
+            is_read_only=False,
+        )
+
+    # Hotplugging a root device must be rejected
+    with pytest.raises(RuntimeError, match="A root block device already exists"):
+        vm.api.drive.put(
+            drive_id="block_root",
+            path_on_host=vm.create_jailed_resource(host_file.path),
+            is_root_device=True,
+            is_read_only=False,
+        )
+
+    # Verify no further devices appeared after the rejected requests
+    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+    _, lspci_final, _ = vm.ssh.check_output("lspci -n")
+    assert lspci_final == lspci_after
+
+
+def test_hotplug_pmem(microvm_factory, guest_kernel_acpi, rootfs):
+    """
+    Test hotplugging a pmem device after VM start.
+    Test that the device appears in lspci and is usable.
+    Test that invalid hotplug request are rejected.
+    """
+    vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=True)
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+    vm.start()
+
+    # Snapshot lspci output before hotplug
+    _, lspci_before, _ = vm.ssh.check_output("lspci -n")
+
+    # Hotplug a pmem device
+    host_file = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "pmem0"), size=4)
+    vm.api.pmem.put(
+        id="pmem0",
+        path_on_host=vm.create_jailed_resource(host_file.path),
+        root_device=False,
+        read_only=False,
+    )
+
+    # Rescan PCI bus since no hotplug notification mechanism exists yet
+    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+
+    # Verify a new virtio-pmem device entry appeared in lspci
+    _, lspci_after, _ = vm.ssh.check_output("lspci -n")
+    new_entries = set(lspci_after.splitlines()) - set(lspci_before.splitlines())
+    assert len(new_entries) == 1
+    entry = new_entries.pop()
+    assert f"{VIRTIO_PCI_VENDOR_ID:04x}:{VIRTIO_PCI_DEVICE_ID_PMEM:04x}" in entry
+
+    # Discover the pmem device node from the PCI BDF via sysfs.
+    # The NVDIMM subsystem in the guest creates the ndbus/region/namespace/block
+    # hierarchy asynchronously after driver probe, so we need to wait for it.
+    vm.ssh.check_output("sleep 1")
+    bdf = entry.split()[0]
+    _, dev_name, _ = vm.ssh.check_output(
+        f"ls /sys/bus/pci/devices/0000:{bdf}/virtio*/ndbus*/region*/namespace*/block/"
+    )
+    dev_path = f"/dev/{dev_name.strip()}"
+
+    # Ensure the device is usable by writing a file to it and reading it back
+    vm.ssh.check_output("mkdir -p /tmp/pmem0_mnt")
+    vm.ssh.check_output(f"mount {dev_path} /tmp/pmem0_mnt")
+    vm.ssh.check_output("echo hotplug_test > /tmp/pmem0_mnt/test")
+    _, stdout, _ = vm.ssh.check_output("cat /tmp/pmem0_mnt/test")
+    assert stdout.strip() == "hotplug_test"
+
+    # Hotplugging a root pmem device must be rejected
+    with pytest.raises(RuntimeError, match="Attempt to add pmem as a root device"):
+        vm.api.pmem.put(
+            id="pmem_root",
+            path_on_host=vm.create_jailed_resource(host_file.path),
+            root_device=True,
+            read_only=False,
+        )
+
+    # Hotplugging a device with a duplicate ID must be rejected
+    with pytest.raises(RuntimeError, match="Device ID in use"):
+        vm.api.pmem.put(
+            id="pmem0",
+            path_on_host=vm.create_jailed_resource(host_file.path),
+            root_device=False,
+            read_only=False,
+        )
+
+    # Verify no further devices appeared after the rejected requests
+    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+    _, lspci_final, _ = vm.ssh.check_output("lspci -n")
+    assert lspci_final == lspci_after
+
+
+def test_hotplug_net(microvm_factory, guest_kernel_acpi, rootfs):
+    """
+    Test hotplugging a net device after VM start.
+    Test that the device appears in lspci and is usable.
+    Test that invalid hotplug request are rejected.
+    """
+    vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=True)
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+    vm.start()
+
+    # Snapshot lspci output before hotplug
+    _, lspci_before, _ = vm.ssh.check_output("lspci -n")
+
+    # Hotplug a network device
+    iface1 = net_tools.NetIfaceConfig.with_id(1)
+    vm.netns.add_tap(iface1.tap_name, ip=f"{iface1.host_ip}/{iface1.netmask_len}")
+    vm.api.network.put(
+        iface_id=iface1.dev_name,
+        host_dev_name=iface1.tap_name,
+        guest_mac=iface1.guest_mac,
+    )
+
+    # Rescan PCI bus since no hotplug notification mechanism exists yet
+    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+
+    # Verify a new net device entry appeared in lspci
+    _, lspci_after, _ = vm.ssh.check_output("lspci -n")
+    new_entries = set(lspci_after.splitlines()) - set(lspci_before.splitlines())
+    assert len(new_entries) == 1
+    entry = new_entries.pop()
+    assert f"{VIRTIO_PCI_VENDOR_ID:04x}:{VIRTIO_PCI_DEVICE_ID_NET:04x}" in entry
+
+    # Discover the net interface name from the PCI BDF via sysfs
+    bdf = entry.split()[0]
+    _, iface_name, _ = vm.ssh.check_output(
+        f"ls /sys/bus/pci/devices/0000:{bdf}/virtio*/net/"
+    )
+    iface_name = iface_name.strip()
+
+    # Verify the hotplugged interface is usable
+    vm.ssh.check_output(f"ip link show {iface_name}")
+    vm.ssh.check_output(
+        f"ip addr add {iface1.guest_ip}/{iface1.netmask_len} dev {iface_name}"
+    )
+    vm.ssh.check_output(f"ip link set {iface_name} up")
+
+    # Ping the host from the guest through the hotplugged interface
+    _, stdout, _ = vm.ssh.check_output(f"ping -c 3 -W 3 {iface1.host_ip}")
+    assert "3 packets transmitted, 3 received" in stdout
+
+    # Hotplugging a device with a duplicate ID must be rejected
+    iface2 = net_tools.NetIfaceConfig.with_id(2)
+    with pytest.raises(RuntimeError, match="Device ID in use"):
+        vm.api.network.put(
+            iface_id=iface1.dev_name,
+            host_dev_name=iface2.tap_name,
+            guest_mac=iface2.guest_mac,
+        )
+
+    # Hotplugging a device with a duplicate MAC must be rejected
+    with pytest.raises(RuntimeError, match="The MAC address is already in use"):
+        vm.api.network.put(
+            iface_id=iface2.dev_name,
+            host_dev_name=iface2.tap_name,
+            guest_mac=iface1.guest_mac,
+        )
+
+    # Hotplugging a device that reuses the same TAP must be rejected
+    with pytest.raises(RuntimeError, match="Resource busy"):
+        vm.api.network.put(
+            iface_id=iface2.dev_name,
+            host_dev_name=iface1.tap_name,
+            guest_mac=iface2.guest_mac,
+        )
+
+    # Verify no further devices appeared after the rejected requests
+    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+    _, lspci_final, _ = vm.ssh.check_output("lspci -n")
+    assert lspci_final == lspci_after
+
+
+def test_hotplug_no_pci(microvm_factory, guest_kernel_acpi, rootfs):
+    """
+    Hotplugging any device type must be rejected when PCI is not enabled.
+    """
+    vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=False)
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+    vm.start()
+
+    host_file = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "disk"), size=4)
+
+    with pytest.raises(RuntimeError, match="PCI is not enabled"):
+        vm.api.drive.put(
+            drive_id="block0",
+            path_on_host=vm.create_jailed_resource(host_file.path),
+            is_root_device=False,
+            is_read_only=False,
+        )
+
+    with pytest.raises(RuntimeError, match="PCI is not enabled"):
+        vm.api.pmem.put(
+            id="pmem0",
+            path_on_host=vm.create_jailed_resource(host_file.path),
+            root_device=False,
+            read_only=False,
+        )
+
+    iface1 = net_tools.NetIfaceConfig.with_id(1)
+    vm.netns.add_tap(iface1.tap_name, ip=f"{iface1.host_ip}/{iface1.netmask_len}")
+    with pytest.raises(RuntimeError, match="PCI is not enabled"):
+        vm.api.network.put(
+            iface_id=iface1.dev_name,
+            host_dev_name=iface1.tap_name,
+            guest_mac=iface1.guest_mac,
+        )
