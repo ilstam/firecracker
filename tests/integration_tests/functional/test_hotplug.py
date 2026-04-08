@@ -20,6 +20,7 @@ def test_hotplug_block(microvm_factory, guest_kernel_acpi, rootfs):
     Test hotplugging a block device after VM start.
     Test that the device appears in lspci and is usable.
     Test that invalid hotplug request are rejected.
+    Test hot-unplugging the device.
     """
     vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=True)
     vm.spawn()
@@ -86,12 +87,29 @@ def test_hotplug_block(microvm_factory, guest_kernel_acpi, rootfs):
     _, lspci_final, _ = vm.ssh.check_output("lspci -n")
     assert lspci_final == lspci_after
 
+    # Unplugging a non-existent device must be rejected
+    with pytest.raises(RuntimeError, match="Device not found"):
+        vm.api.drive.delete("nonexistent")
+
+    # No unplug notification mechanism exists yet, so the guest needs to
+    # gracefully prepare for the detach before the host issues the unplug.
+    vm.ssh.check_output("umount /tmp/block0_mnt")
+    vm.ssh.check_output(f"echo 1 > /sys/bus/pci/devices/0000:{bdf}/remove")
+
+    # Unplug the block device
+    vm.api.drive.delete("block0")
+
+    # Verify the device is gone
+    _, lspci_after_unplug, _ = vm.ssh.check_output("lspci -n")
+    assert lspci_after_unplug == lspci_before
+
 
 def test_hotplug_pmem(microvm_factory, guest_kernel_acpi, rootfs):
     """
     Test hotplugging a pmem device after VM start.
     Test that the device appears in lspci and is usable.
     Test that invalid hotplug request are rejected.
+    Test hot-unplugging the device.
     """
     vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=True)
     vm.spawn()
@@ -161,12 +179,29 @@ def test_hotplug_pmem(microvm_factory, guest_kernel_acpi, rootfs):
     _, lspci_final, _ = vm.ssh.check_output("lspci -n")
     assert lspci_final == lspci_after
 
+    # Unplugging a non-existent device must be rejected
+    with pytest.raises(RuntimeError, match="Device not found"):
+        vm.api.pmem.delete("nonexistent")
+
+    # No unplug notification mechanism exists yet, so the guest needs to
+    # gracefully prepare for the detach before the host issues the unplug.
+    vm.ssh.check_output("umount /tmp/pmem0_mnt")
+    vm.ssh.check_output(f"echo 1 > /sys/bus/pci/devices/0000:{bdf}/remove")
+
+    # Unplug the pmem device
+    vm.api.pmem.delete("pmem0")
+
+    # Verify the device is gone
+    _, lspci_after_unplug, _ = vm.ssh.check_output("lspci -n")
+    assert lspci_after_unplug == lspci_before
+
 
 def test_hotplug_net(microvm_factory, guest_kernel_acpi, rootfs):
     """
     Test hotplugging a net device after VM start.
     Test that the device appears in lspci and is usable.
     Test that invalid hotplug request are rejected.
+    Test hot-unplugging the device.
     """
     vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=True)
     vm.spawn()
@@ -244,10 +279,58 @@ def test_hotplug_net(microvm_factory, guest_kernel_acpi, rootfs):
     _, lspci_final, _ = vm.ssh.check_output("lspci -n")
     assert lspci_final == lspci_after
 
+    # Unplugging a non-existent device must be rejected
+    with pytest.raises(RuntimeError, match="Device not found"):
+        vm.api.network.delete("nonexistent")
+
+    # No unplug notification mechanism exists yet, so the guest needs to
+    # gracefully prepare for the detach before the host issues the unplug.
+    vm.ssh.check_output(f"ip link set {iface_name} down")
+    vm.ssh.check_output(f"echo 1 > /sys/bus/pci/devices/0000:{bdf}/remove")
+
+    # Unplug the net device
+    vm.api.network.delete(iface1.dev_name)
+
+    # Verify the device is gone
+    _, lspci_after_unplug, _ = vm.ssh.check_output("lspci -n")
+    assert lspci_after_unplug == lspci_before
+
+
+def test_unplug_root_block(microvm_factory, guest_kernel_acpi, rootfs):
+    """
+    Unplugging the root block device must be rejected.
+    """
+    vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=True)
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+    vm.start()
+
+    with pytest.raises(RuntimeError, match="Cannot unplug root device"):
+        vm.api.drive.delete("rootfs")
+
+
+def test_unplug_root_pmem(microvm_factory, guest_kernel_acpi, rootfs):
+    """
+    Unplugging the root pmem device must be rejected.
+    """
+    vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=True)
+    vm.memory_monitor = None
+    vm.monitors = []
+    vm.spawn()
+    vm.basic_config(add_root_device=False)
+    vm.add_pmem("pmem_root", rootfs, root_device=True)
+    vm.add_net_iface()
+    vm.start()
+
+    with pytest.raises(RuntimeError, match="Cannot unplug root device"):
+        vm.api.pmem.delete("pmem_root")
+
 
 def test_hotplug_no_pci(microvm_factory, guest_kernel_acpi, rootfs):
     """
-    Hotplugging any device type must be rejected when PCI is not enabled.
+    Hotplugging and unplugging any device type must be rejected when PCI is not
+    enabled.
     """
     vm = microvm_factory.build(guest_kernel_acpi, rootfs, pci=False)
     vm.spawn()
@@ -281,3 +364,12 @@ def test_hotplug_no_pci(microvm_factory, guest_kernel_acpi, rootfs):
             host_dev_name=iface1.tap_name,
             guest_mac=iface1.guest_mac,
         )
+
+    with pytest.raises(RuntimeError, match="PCI is not enabled"):
+        vm.api.drive.delete("block0")
+
+    with pytest.raises(RuntimeError, match="PCI is not enabled"):
+        vm.api.pmem.delete("pmem0")
+
+    with pytest.raises(RuntimeError, match="PCI is not enabled"):
+        vm.api.network.delete("eth0")
