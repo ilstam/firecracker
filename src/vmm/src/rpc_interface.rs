@@ -208,6 +208,10 @@ pub enum VmmActionError {
     VsockConfig(#[from] VsockConfigError),
     /// Device ID in use
     DeviceIdInUse,
+    /// Device not found
+    DeviceNotFound,
+    /// Cannot unplug root device
+    CannotUnplugRootDevice,
     /// PCI is not enabled
     PciNotEnabled,
     /// PCI manager error: {0}

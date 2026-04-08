@@ -302,14 +302,68 @@ impl PciDevices {
         Ok(Arc::new(Mutex::new(net)))
     }
 
+    /// Returns true if the given PCI device is a root block or pmem device.
+    fn is_root_device(pci_device: &Arc<Mutex<VirtioPciDevice>>) -> bool {
+        let pci_device = pci_device.lock().expect("Poisoned lock");
+        let virtio_device = pci_device.virtio_device();
+        let virtio_device = virtio_device.lock().expect("Poisoned lock");
+
+        if let Some(block) = virtio_device.as_any().downcast_ref::<Block>() {
+            return block.root_device();
+        }
+        if let Some(pmem) = virtio_device.as_any().downcast_ref::<Pmem>() {
+            return pmem.config.root_device;
+        }
+        false
+    }
+
     /// Detaches a device after VM start
     pub fn hot_unplug_device(
         &mut self,
-        _vm: &Arc<Vm>,
-        _device_id: VirtioDeviceId,
-        _event_manager: &mut EventManager,
+        vm: &Arc<Vm>,
+        device_id: VirtioDeviceId,
+        event_manager: &mut EventManager,
     ) -> Result<(), VmmActionError> {
-        todo!()
+        if self.pci_segment.is_none() {
+            return Err(VmmActionError::PciNotEnabled);
+        }
+
+        let pci_device = self
+            .virtio_devices
+            .get(&device_id)
+            .ok_or(VmmActionError::DeviceNotFound)?;
+
+        if Self::is_root_device(pci_device) {
+            return Err(VmmActionError::CannotUnplugRootDevice);
+        }
+
+        // Key existence already verified above.
+        let pci_device = self.virtio_devices.remove(&device_id).unwrap();
+        let pci_device = pci_device.lock().expect("Poisoned lock");
+
+        // Remove PCIe BAR from the bus
+        vm.common
+            .mmio_bus
+            .remove(pci_device.bar_address, CAPABILITY_BAR_SIZE)
+            .map_err(PciManagerError::Bus)?;
+
+        // Remove from PCI bus
+        self.pci_segment
+            .as_ref()
+            .unwrap()
+            .pci_bus
+            .lock()
+            .expect("Poisoned lock")
+            .remove_device(pci_device.sbdf.device());
+
+        // Remove event subscriber
+        if let Some(sub_id) = pci_device.sub_id
+            && event_manager.remove_subscriber(sub_id).is_err()
+        {
+            warn!("Failed to remove event subscriber for device {device_id:?}");
+        }
+
+        Ok(())
     }
 }
 
