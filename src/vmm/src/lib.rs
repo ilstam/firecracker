@@ -141,7 +141,7 @@ use crate::devices::virtio::balloon::{
 };
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
-use crate::devices::virtio::device::VirtioDeviceType;
+use crate::devices::virtio::device::{VirtioDeviceId, VirtioDeviceType};
 use crate::devices::virtio::mem::device::VirtioMem;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemStatus};
 use crate::devices::virtio::net::Net;
@@ -795,6 +795,18 @@ impl Vmm {
         self.device_manager
             .pci_devices
             .hotplug_device(&self.vm, config, event_manager)
+    }
+
+    /// Detaches a device after VM start
+    #[inline]
+    pub fn hot_unplug_device(
+        &mut self,
+        device_id: VirtioDeviceId,
+        event_manager: &mut EventManager,
+    ) -> Result<(), VmmActionError> {
+        self.device_manager
+            .pci_devices
+            .hot_unplug_device(&self.vm, device_id, event_manager)
     }
 }
 

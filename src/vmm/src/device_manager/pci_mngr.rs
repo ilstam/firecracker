@@ -301,6 +301,16 @@ impl PciDevices {
         let net = NetBuilder::create_net(config)?;
         Ok(Arc::new(Mutex::new(net)))
     }
+
+    /// Detaches a device after VM start
+    pub fn hot_unplug_device(
+        &mut self,
+        _vm: &Arc<Vm>,
+        _device_id: VirtioDeviceId,
+        _event_manager: &mut EventManager,
+    ) -> Result<(), VmmActionError> {
+        todo!()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
