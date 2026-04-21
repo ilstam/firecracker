@@ -102,9 +102,9 @@ def test_serial_active_tx_snapshot(uvm_plain, microvm_factory, i):
     # Send Ctrl-C to the guest to stop the ongoing transmission and regain the shell
     serial.tx("\x03", end="")
     # looking for the # prompt at the end
-    serial.rx("ubuntu-fc-uvm:~#")
+    serial.rx("ubuntu-fc-uvm:~#", strip_null=True)
     serial.tx("pwd")
-    res = serial.rx("#")
+    res = serial.rx("#", strip_null=True)
     assert "/root" in res
 
 

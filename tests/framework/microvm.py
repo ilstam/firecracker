@@ -1440,18 +1440,21 @@ class Serial:
 
         return ""
 
-    def rx(self, token="\n"):
+    def rx(self, token="\n", strip_null=False):
         # pylint: disable=invalid-name
         # No need to have a snake_case naming style for a single word.
         r"""Read a string delimited by an end token (defaults to "\n")."""
         rx_str = ""
         start = time.time()
         while True:
-            rx_str += self.rx_char()
-            if rx_str.endswith(token):
-                break
             if (time.time() - start) >= self.RX_TIMEOUT_S:
                 self._vm.kill()
                 assert False
+            ch = self.rx_char()
+            if strip_null and ch == "\x00":
+                continue
+            rx_str += ch
+            if rx_str.endswith(token):
+                break
 
         return rx_str
