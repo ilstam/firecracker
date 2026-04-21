@@ -97,6 +97,10 @@ def test_serial_active_tx_snapshot(uvm_plain, microvm_factory):
     serial = Serial(vm)
     serial.open()
 
+    # Discard all the null bytes that accumulated in the serial log during
+    # the cat /dev/zero transmission, so that rx() doesn't have to read
+    # through them one by one.
+    serial.drain()
     # Send Ctrl-C to the guest to stop the ongoing transmission and regain the shell
     serial.tx("\x03", end="")
     # looking for the # prompt at the end

@@ -1416,9 +1416,13 @@ class Serial:
             time.sleep(0.2)
             attempt += 1
 
-        serial_log_fd = os.open(self._vm.screen_log, os.O_RDONLY)
+        self._fd = os.open(self._vm.screen_log, os.O_RDONLY)
         self._poller = select.poll()
-        self._poller.register(serial_log_fd, select.POLLIN | select.POLLHUP)
+        self._poller.register(self._fd, select.POLLIN | select.POLLHUP)
+
+    def drain(self):
+        """Discard all pending data by seeking to the end of the log file."""
+        os.lseek(self._fd, 0, os.SEEK_END)
 
     def tx(self, input_string, end="\n"):
         # pylint: disable=invalid-name
