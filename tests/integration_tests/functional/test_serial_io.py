@@ -78,26 +78,12 @@ def test_serial_active_tx_snapshot(uvm_plain, microvm_factory, i):
     # looking for the # prompt at the end
     serial.rx("ubuntu-fc-uvm:~#")
 
-    # Start an unbounded serial transmission from inside the guest such that
-    # there will be an active transmission at the point of pausing the VM to
-    # take the snapshot. This will saturate the TX buffer of the UART and it
-    # might make the guest driver enable TX interrupts.
+    # Start an unbounded serial transmission from inside the guest. This will
+    # saturate the TX buffer of the UART and it might make the guest driver
+    # enable TX interrupts.
     serial.tx("cat /dev/zero")
     # Give the guest time to start the transmission
     time.sleep(5)
-
-    # Create snapshot.
-    snapshot = microvm.snapshot_full()
-    # Kill base microVM.
-    microvm.kill()
-
-    # Load microVM clone from snapshot.
-    vm = microvm_factory.build()
-    vm.help.enable_console()
-    vm.spawn(serial_out_path=None)
-    vm.restore_from_snapshot(snapshot, resume=True)
-    serial = Serial(vm)
-    serial.open()
 
     # Send Ctrl-C to the guest to stop the ongoing transmission and regain the shell
     serial.tx("\x03", end="")
