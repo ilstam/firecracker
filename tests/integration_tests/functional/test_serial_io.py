@@ -84,7 +84,7 @@ def test_serial_active_tx_snapshot(uvm_plain, microvm_factory, i):
     # might make the guest driver enable TX interrupts.
     serial.tx("cat /dev/zero")
     # Give the guest time to start the transmission
-    time.sleep(1)
+    time.sleep(5)
 
     # Create snapshot.
     snapshot = microvm.snapshot_full()
