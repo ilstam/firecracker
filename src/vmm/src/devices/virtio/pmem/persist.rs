@@ -2,16 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use vm_memory::GuestAddress;
 
 use super::device::{ConfigSpace, Pmem, PmemError};
 use crate::Vm;
-use crate::devices::virtio::device::{DeviceState, VirtioDeviceType};
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
-use crate::devices::virtio::pmem::{PMEM_NUM_QUEUES, PMEM_QUEUE_SIZE};
 use crate::snapshot::Persist;
 use crate::vmm_config::pmem::PmemConfig;
-use crate::vstate::memory::{GuestMemoryMmap, GuestRegionMmap};
+use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::VmError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,21 +51,11 @@ impl<'a> Persist<'a> for Pmem {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let queues = state.virtio_state.build_queues_checked(
-            constructor_args.mem,
-            VirtioDeviceType::Pmem,
-            PMEM_NUM_QUEUES,
-            PMEM_QUEUE_SIZE,
-        )?;
-
-        let mut pmem = Pmem::new_with_queues(state.config.clone(), queues)?;
-        pmem.config_space = state.config_space;
-        pmem.avail_features = state.virtio_state.avail_features;
-        pmem.acked_features = state.virtio_state.acked_features;
-
-        pmem.set_mem_region(constructor_args.vm)?;
-
-        Ok(pmem)
+        Ok(Pmem::new(
+            state.config.clone(),
+            constructor_args.vm,
+            Some((state, constructor_args.mem)),
+        )?)
     }
 }
 
@@ -78,7 +65,9 @@ mod tests {
 
     use super::*;
     use crate::arch::Kvm;
-    use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+    use crate::devices::virtio::pmem::PMEM_QUEUE_SIZE;
+    use crate::devices::virtio::queue::Queue;
     use crate::devices::virtio::test_utils::default_mem;
 
     #[test]
@@ -93,7 +82,7 @@ mod tests {
             root_device: true,
             read_only: false,
         };
-        let pmem = Pmem::new(config).unwrap();
+        let pmem = Pmem::new_with_queues(config, vec![Queue::new(PMEM_QUEUE_SIZE)]).unwrap();
         let guest_mem = default_mem();
         let kvm = Kvm::new(vec![]).unwrap();
         let vm = Vm::new(&kvm).unwrap();

@@ -17,8 +17,9 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
-use crate::devices::virtio::pmem::PMEM_QUEUE_SIZE;
 use crate::devices::virtio::pmem::metrics::{PmemMetrics, PmemMetricsPerDevice};
+use crate::devices::virtio::pmem::persist::PmemState;
+use crate::devices::virtio::pmem::{PMEM_NUM_QUEUES, PMEM_QUEUE_SIZE};
 use crate::devices::virtio::queue::{DescriptorChain, InvalidAvailIdx, Queue, QueueError};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::logger::{IncMetric, error, info};
@@ -56,6 +57,8 @@ pub enum PmemError {
     Queue(#[from] QueueError),
     /// Error during obtaining the descriptor from the queue: {0}
     QueuePop(#[from] InvalidAvailIdx),
+    /// Error restoring queues from snapshot: {0}
+    QueueRestore(crate::devices::virtio::persist::PersistError),
 }
 
 const VIRTIO_PMEM_REQ_TYPE_FLUSH: u32 = 0;
@@ -113,8 +116,37 @@ impl Pmem {
     pub const ALIGNMENT: u64 = 2 * 1024 * 1024;
 
     /// Create a new Pmem device with a backing file at `disk_image_path` path.
-    pub fn new(config: PmemConfig) -> Result<Self, PmemError> {
-        Self::new_with_queues(config, vec![Queue::new(PMEM_QUEUE_SIZE)])
+    /// When `state` is Some(), the device is restored from saved state stored
+    /// in a snapshot.
+    pub fn new(
+        config: PmemConfig,
+        vm: &Vm,
+        state: Option<(&PmemState, &GuestMemoryMmap)>,
+    ) -> Result<Self, PmemError> {
+        let queues = match state {
+            Some((state, mem)) => state
+                .virtio_state
+                .build_queues_checked(
+                    mem,
+                    VirtioDeviceType::Pmem,
+                    PMEM_NUM_QUEUES,
+                    PMEM_QUEUE_SIZE,
+                )
+                .map_err(PmemError::QueueRestore)?,
+            None => vec![Queue::new(PMEM_QUEUE_SIZE)],
+        };
+
+        let mut pmem = Self::new_with_queues(config, queues)?;
+
+        if let Some((state, _)) = state {
+            pmem.config_space = state.config_space;
+            pmem.avail_features = state.virtio_state.avail_features;
+            pmem.acked_features = state.virtio_state.acked_features;
+        } else {
+            pmem.alloc_region(vm)?;
+        }
+        pmem.set_mem_region(vm)?;
+        Ok(pmem)
     }
 
     /// Create a new Pmem device with a backing file at `disk_image_path` path using a pre-created
@@ -215,7 +247,7 @@ impl Pmem {
     }
 
     /// Allocate memory in past_mmio64 memory region
-    pub fn alloc_region(&mut self, vm: &Vm) -> Result<(), PmemError> {
+    fn alloc_region(&mut self, vm: &Vm) -> Result<(), PmemError> {
         let mut resource_allocator_lock = vm.resource_allocator();
         let resource_allocator = resource_allocator_lock.deref_mut();
         let addr = resource_allocator
@@ -231,7 +263,7 @@ impl Pmem {
     }
 
     /// Set user memory region in KVM
-    pub fn set_mem_region(&mut self, vm: &Vm) -> Result<(), PmemError> {
+    fn set_mem_region(&mut self, vm: &Vm) -> Result<(), PmemError> {
         let next_slot = vm.next_kvm_slot(1).ok_or(PmemError::NoKvmSlotAvailable)?;
         let memory_region = kvm_userspace_memory_region {
             slot: next_slot,
@@ -418,11 +450,15 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::arch::Kvm;
     use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
 
     #[test]
     fn test_from_config() {
+        let kvm = Kvm::new(vec![]).unwrap();
+        let vm = Vm::new(&kvm).unwrap();
+
         let config = PmemConfig {
             id: "1".into(),
             path_on_host: "not_a_path".into(),
@@ -430,7 +466,7 @@ mod tests {
             read_only: false,
         };
         assert!(matches!(
-            Pmem::new(config).unwrap_err(),
+            Pmem::new(config, &vm, None).unwrap_err(),
             PmemError::BackingFile(_),
         ));
 
@@ -443,7 +479,7 @@ mod tests {
             read_only: false,
         };
         assert!(matches!(
-            Pmem::new(config).unwrap_err(),
+            Pmem::new(config, &vm, None).unwrap_err(),
             PmemError::BackingFileZeroSize,
         ));
 
@@ -454,11 +490,14 @@ mod tests {
             root_device: true,
             read_only: false,
         };
-        Pmem::new(config).unwrap();
+        Pmem::new(config, &vm, None).unwrap();
     }
 
     #[test]
     fn test_process_chain() {
+        let kvm = Kvm::new(vec![]).unwrap();
+        let vm = Vm::new(&kvm).unwrap();
+
         let dummy_file = TempFile::new().unwrap();
         dummy_file.as_file().set_len(0x20_0000);
         let dummy_path = dummy_file.as_path().to_str().unwrap().to_string();
@@ -468,7 +507,7 @@ mod tests {
             root_device: true,
             read_only: false,
         };
-        let mut pmem = Pmem::new(config).unwrap();
+        let mut pmem = Pmem::new(config, &vm, None).unwrap();
 
         let mem = default_mem();
         let interrupt = default_interrupt();
