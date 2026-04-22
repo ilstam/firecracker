@@ -1,6 +1,8 @@
 // Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use super::device::{ConfigSpace, Pmem, PmemError};
@@ -21,7 +23,7 @@ pub struct PmemState {
 #[derive(Debug)]
 pub struct PmemConstructorArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
-    pub vm: &'a Vm,
+    pub vm: &'a Arc<Vm>,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -82,14 +84,15 @@ mod tests {
             root_device: true,
             read_only: false,
         };
-        let pmem = Pmem::new_with_queues(config, vec![Queue::new(PMEM_QUEUE_SIZE)]).unwrap();
         let guest_mem = default_mem();
         let kvm = Kvm::new(vec![]).unwrap();
-        let vm = Vm::new(&kvm).unwrap();
+        let vm = Arc::new(Vm::new(&kvm).unwrap());
+        let pmem = Pmem::new(config, &vm, None).unwrap();
 
         // Save the block device.
         let pmem_state = pmem.save();
         let serialized_data = bitcode::serialize(&pmem_state).unwrap();
+        drop(pmem);
 
         // Restore the block device.
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
@@ -104,11 +107,15 @@ mod tests {
 
         // Test that virtio specific fields are the same.
         assert_eq!(restored_pmem.device_type(), VirtioDeviceType::Pmem);
-        assert_eq!(restored_pmem.avail_features(), pmem.avail_features());
-        assert_eq!(restored_pmem.acked_features(), pmem.acked_features());
-        assert_eq!(restored_pmem.queues(), pmem.queues());
-        assert!(!pmem.is_activated());
+        assert_eq!(
+            restored_pmem.avail_features(),
+            pmem_state.virtio_state.avail_features
+        );
+        assert_eq!(
+            restored_pmem.acked_features(),
+            pmem_state.virtio_state.acked_features
+        );
         assert!(!restored_pmem.is_activated());
-        assert_eq!(restored_pmem.config, pmem.config);
+        assert_eq!(restored_pmem.config, pmem_state.config);
     }
 }

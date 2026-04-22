@@ -97,10 +97,36 @@ pub struct Pmem {
     pub metrics: Arc<PmemMetrics>,
 
     pub config: PmemConfig,
+
+    vm: Arc<Vm>,
+    kvm_slot: Option<u32>,
 }
 
 impl Drop for Pmem {
     fn drop(&mut self) {
+        if let Some(slot) = self.kvm_slot {
+            // Unregister the KVM memory region by setting memory_size to 0.
+            let region = kvm_userspace_memory_region {
+                slot,
+                guest_phys_addr: 0,
+                memory_size: 0,
+                userspace_addr: 0,
+                flags: 0,
+            };
+            let _ = self.vm.set_user_memory_region(region);
+        }
+
+        // Free the allocated guest address range.
+        if self.config_space.start != 0
+            && let Ok(range) = vm_allocator::RangeInclusive::new(
+                self.config_space.start,
+                self.config_space.start + self.config_space.size - 1,
+            )
+        {
+            let mut alloc = self.vm.resource_allocator();
+            let _ = alloc.past_mmio64_memory.free(&range);
+        }
+
         let mmap_len = align_up(self.file_len, Self::ALIGNMENT);
         // SAFETY: `mmap_ptr` is a valid pointer since Pmem can only be created with `new*` methods.
         //         Mapping size calculation is same for original mmap call.
@@ -120,7 +146,7 @@ impl Pmem {
     /// in a snapshot.
     pub fn new(
         config: PmemConfig,
-        vm: &Vm,
+        vm: &Arc<Vm>,
         state: Option<(&PmemState, &GuestMemoryMmap)>,
     ) -> Result<Self, PmemError> {
         let queues = match state {
@@ -136,7 +162,7 @@ impl Pmem {
             None => vec![Queue::new(PMEM_QUEUE_SIZE)],
         };
 
-        let mut pmem = Self::new_with_queues(config, queues)?;
+        let mut pmem = Self::new_with_queues(config, queues, Arc::clone(vm))?;
 
         if let Some((state, _)) = state {
             pmem.config_space = state.config_space;
@@ -151,7 +177,11 @@ impl Pmem {
 
     /// Create a new Pmem device with a backing file at `disk_image_path` path using a pre-created
     /// set of queues.
-    pub fn new_with_queues(config: PmemConfig, queues: Vec<Queue>) -> Result<Self, PmemError> {
+    fn new_with_queues(
+        config: PmemConfig,
+        queues: Vec<Queue>,
+        vm: Arc<Vm>,
+    ) -> Result<Self, PmemError> {
         let (file, file_len, mmap_ptr, mmap_len) =
             Self::mmap_backing_file(&config.path_on_host, config.read_only)?;
 
@@ -171,6 +201,8 @@ impl Pmem {
             mmap_ptr,
             metrics: PmemMetricsPerDevice::alloc(config.id.clone()),
             config,
+            vm,
+            kvm_slot: None,
         })
     }
 
@@ -278,7 +310,9 @@ impl Pmem {
         };
 
         vm.set_user_memory_region(memory_region)
-            .map_err(PmemError::SetUserMemoryRegion)
+            .map_err(PmemError::SetUserMemoryRegion)?;
+        self.kvm_slot = Some(next_slot);
+        Ok(())
     }
 
     pub fn handle_queue(&mut self) -> Result<(), PmemError> {
@@ -457,7 +491,7 @@ mod tests {
     #[test]
     fn test_from_config() {
         let kvm = Kvm::new(vec![]).unwrap();
-        let vm = Vm::new(&kvm).unwrap();
+        let vm = Arc::new(Vm::new(&kvm).unwrap());
 
         let config = PmemConfig {
             id: "1".into(),
@@ -496,7 +530,7 @@ mod tests {
     #[test]
     fn test_process_chain() {
         let kvm = Kvm::new(vec![]).unwrap();
-        let vm = Vm::new(&kvm).unwrap();
+        let vm = Arc::new(Vm::new(&kvm).unwrap());
 
         let dummy_file = TempFile::new().unwrap();
         dummy_file.as_file().set_len(0x20_0000);

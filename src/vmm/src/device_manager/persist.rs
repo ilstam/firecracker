@@ -564,10 +564,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
 
         for pmem_state in &state.pmem_devices {
             let device = Arc::new(Mutex::new(Pmem::restore(
-                PmemConstructorArgs {
-                    mem,
-                    vm: vm.as_ref(),
-                },
+                PmemConstructorArgs { mem, vm },
                 &pmem_state.device_state,
             )?));
 
