@@ -162,33 +162,13 @@ impl Pmem {
             None => vec![Queue::new(PMEM_QUEUE_SIZE)],
         };
 
-        let mut pmem = Self::new_with_queues(config, queues, Arc::clone(vm))?;
-
-        if let Some((state, _)) = state {
-            pmem.config_space = state.config_space;
-            pmem.avail_features = state.virtio_state.avail_features;
-            pmem.acked_features = state.virtio_state.acked_features;
-        } else {
-            pmem.alloc_region(vm)?;
-        }
-        pmem.set_mem_region(vm)?;
-        Ok(pmem)
-    }
-
-    /// Create a new Pmem device with a backing file at `disk_image_path` path using a pre-created
-    /// set of queues.
-    fn new_with_queues(
-        config: PmemConfig,
-        queues: Vec<Queue>,
-        vm: Arc<Vm>,
-    ) -> Result<Self, PmemError> {
         let activate_event = EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?;
         let queue_events = vec![EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?];
 
         let (file, file_len, mmap_ptr, mmap_len) =
             Self::mmap_backing_file(&config.path_on_host, config.read_only)?;
 
-        Ok(Self {
+        let mut pmem = Self {
             avail_features: 1u64 << VIRTIO_F_VERSION_1,
             acked_features: 0u64,
             activate_event,
@@ -204,9 +184,19 @@ impl Pmem {
             mmap_ptr,
             metrics: PmemMetricsPerDevice::alloc(config.id.clone()),
             config,
-            vm,
+            vm: Arc::clone(vm),
             kvm_slot: None,
-        })
+        };
+
+        if let Some((state, _)) = state {
+            pmem.config_space = state.config_space;
+            pmem.avail_features = state.virtio_state.avail_features;
+            pmem.acked_features = state.virtio_state.acked_features;
+        } else {
+            pmem.alloc_region(vm)?;
+        }
+        pmem.set_mem_region(vm)?;
+        Ok(pmem)
     }
 
     fn mmap_backing_file(path: &str, read_only: bool) -> Result<(File, u64, u64, u64), PmemError> {
