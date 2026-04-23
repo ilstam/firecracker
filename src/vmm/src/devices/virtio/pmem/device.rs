@@ -182,16 +182,19 @@ impl Pmem {
         queues: Vec<Queue>,
         vm: Arc<Vm>,
     ) -> Result<Self, PmemError> {
+        let activate_event = EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?;
+        let queue_events = vec![EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?];
+
         let (file, file_len, mmap_ptr, mmap_len) =
             Self::mmap_backing_file(&config.path_on_host, config.read_only)?;
 
         Ok(Self {
             avail_features: 1u64 << VIRTIO_F_VERSION_1,
             acked_features: 0u64,
-            activate_event: EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?,
+            activate_event,
             device_state: DeviceState::Inactive,
             queues,
-            queue_events: vec![EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?],
+            queue_events,
             config_space: ConfigSpace {
                 start: 0,
                 size: mmap_len,
