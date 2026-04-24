@@ -83,7 +83,7 @@ def test_serial_active_tx_snapshot(uvm_plain, microvm_factory, i):
     # enable TX interrupts.
     serial.tx("cat /dev/zero")
     # Give the guest time to start the transmission
-    time.sleep(5)
+    time.sleep(0.2)
 
     # Send Ctrl-C to the guest to stop the ongoing transmission and regain the shell
     serial.tx("\x03", end="")
