@@ -68,7 +68,7 @@ def test_serial_active_tx_snapshot(uvm_plain, microvm_factory, i):
     microvm.help.enable_console()
     microvm.spawn(serial_out_path=None)
     microvm.basic_config(
-        vcpu_count=2,
+        vcpu_count=4,
         mem_size_mib=256,
     )
     serial = Serial(microvm)
