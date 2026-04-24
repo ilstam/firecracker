@@ -68,7 +68,7 @@ def test_serial_active_tx_snapshot(uvm_plain, microvm_factory, i):
     microvm.help.enable_console()
     microvm.spawn(serial_out_path=None)
     microvm.basic_config(
-        vcpu_count=4,
+        vcpu_count=2,
         mem_size_mib=256,
     )
     serial = Serial(microvm)
@@ -83,7 +83,7 @@ def test_serial_active_tx_snapshot(uvm_plain, microvm_factory, i):
     # enable TX interrupts.
     serial.tx("cat /dev/zero")
     # Give the guest time to start the transmission
-    time.sleep(0.2)
+    #  time.sleep(0)
 
     # Send Ctrl-C to the guest to stop the ongoing transmission and regain the shell
     serial.tx("\x03", end="")
