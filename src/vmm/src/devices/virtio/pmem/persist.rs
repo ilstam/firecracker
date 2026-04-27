@@ -61,14 +61,7 @@ impl<'a> Persist<'a> for Pmem {
             PMEM_QUEUE_SIZE,
         )?;
 
-        let mut pmem = Pmem::new_with_queues(state.config.clone(), queues)?;
-        pmem.config_space = state.config_space;
-        pmem.avail_features = state.virtio_state.avail_features;
-        pmem.acked_features = state.virtio_state.acked_features;
-
-        pmem.set_mem_region(constructor_args.vm)?;
-
-        Ok(pmem)
+        Ok(Pmem::from_state(constructor_args.vm, state, queues)?)
     }
 }
 
@@ -79,7 +72,33 @@ mod tests {
     use super::*;
     use crate::arch::Kvm;
     use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
+    use crate::devices::virtio::pmem::device::PmemMmap;
+    use crate::devices::virtio::pmem::metrics::PmemMetricsPerDevice;
+    use crate::devices::virtio::queue::Queue;
     use crate::devices::virtio::test_utils::default_mem;
+    use vmm_sys_util::eventfd::EventFd;
+
+    /// Create a Pmem without registering KVM memory regions.
+    fn test_pmem(config: PmemConfig) -> Pmem {
+        let mmap = PmemMmap::new(&config.path_on_host, config.read_only).unwrap();
+        let mmap_len = mmap.mmap_len;
+        Pmem {
+            avail_features: 1u64 << VIRTIO_F_VERSION_1,
+            acked_features: 0u64,
+            activate_event: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            device_state: DeviceState::Inactive,
+            queues: vec![Queue::new(PMEM_QUEUE_SIZE)],
+            queue_events: vec![EventFd::new(libc::EFD_NONBLOCK).unwrap()],
+            config_space: ConfigSpace {
+                start: 0,
+                size: mmap_len,
+            },
+            metrics: PmemMetricsPerDevice::alloc(config.id.clone()),
+            config,
+            mmap,
+        }
+    }
 
     #[test]
     fn test_persistence() {
@@ -93,7 +112,7 @@ mod tests {
             root_device: true,
             read_only: false,
         };
-        let pmem = Pmem::new(config).unwrap();
+        let pmem = test_pmem(config);
         let guest_mem = default_mem();
         let kvm = Kvm::new(vec![]).unwrap();
         let vm = Vm::new(&kvm).unwrap();
