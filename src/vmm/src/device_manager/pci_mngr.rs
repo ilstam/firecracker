@@ -576,7 +576,7 @@ impl<'a> Persist<'a> for PciDevices {
             let device = Arc::new(Mutex::new(Pmem::restore(
                 PmemConstructorArgs {
                     mem,
-                    vm: constructor_args.vm.as_ref(),
+                    vm: Arc::clone(constructor_args.vm),
                 },
                 &pmem_state.device_state,
             )?));

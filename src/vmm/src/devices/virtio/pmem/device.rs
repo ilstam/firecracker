@@ -7,7 +7,6 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
 use kvm_bindings::{KVM_MEM_READONLY, kvm_userspace_memory_region};
-use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
 use vm_allocator::AllocPolicy;
 use vm_memory::mmap::{MmapRegionBuilder, MmapRegionError};
@@ -76,6 +75,52 @@ pub struct ConfigSpace {
 
 // SAFETY: `ConfigSpace` contains only PODs in `repr(c)`, without padding.
 unsafe impl ByteValued for ConfigSpace {}
+
+/// RAII wrapper for the KVM user memory region. Removes the region on drop.
+#[derive(Debug)]
+pub struct KvmMemSlot {
+    vm: Arc<Vm>,
+    slot: u32,
+}
+
+impl KvmMemSlot {
+    fn new(
+        vm: Arc<Vm>,
+        gpa: u64,
+        memory_size: u64,
+        hva: u64,
+        flags: u32,
+    ) -> Result<Self, PmemError> {
+        // FIXME: The KVM slot number itself is not returned. This is not an
+        // issue currently since there are at least 32K slots available. But we
+        // could improve this by implementing a slot allocator that allows us
+        // to free slot numbers.
+        let slot = vm.next_kvm_slot(1).ok_or(PmemError::NoKvmSlotAvailable)?;
+        let region = kvm_userspace_memory_region {
+            slot,
+            guest_phys_addr: gpa,
+            memory_size,
+            userspace_addr: hva,
+            flags,
+        };
+        vm.set_user_memory_region(region)
+            .map_err(PmemError::SetUserMemoryRegion)?;
+        Ok(Self { vm, slot })
+    }
+}
+
+impl Drop for KvmMemSlot {
+    fn drop(&mut self) {
+        let region = kvm_userspace_memory_region {
+            slot: self.slot,
+            guest_phys_addr: 0,
+            memory_size: 0,
+            userspace_addr: 0,
+            flags: 0,
+        };
+        _ = self.vm.set_user_memory_region(region);
+    }
+}
 
 /// RAII wrapper for the pmem mmap region. Performs mmap on construction and munmap on drop.
 #[derive(Debug)]
@@ -195,6 +240,7 @@ pub struct Pmem {
     // Pmem specific fields
     pub config_space: ConfigSpace,
     pub mmap: PmemMmap,
+    pub kvm_mem_slot: KvmMemSlot,
     pub metrics: Arc<PmemMetrics>,
 
     pub config: PmemConfig,
@@ -206,9 +252,9 @@ impl Pmem {
     pub const ALIGNMENT: u64 = 2 * 1024 * 1024;
 
     /// Create a new Pmem device with a backing file and register it with KVM.
-    pub fn new(vm: &Vm, config: PmemConfig) -> Result<Self, PmemError> {
+    pub fn new(vm: Arc<Vm>, config: PmemConfig) -> Result<Self, PmemError> {
         let mmap = PmemMmap::new(&config.path_on_host, config.read_only)?;
-        let start = Self::alloc_region(vm, mmap.mmap_len)?;
+        let start = Self::alloc_region(&vm, mmap.mmap_len)?;
 
         let state = PmemState {
             virtio_state: VirtioDeviceState {
@@ -228,10 +274,26 @@ impl Pmem {
     }
 
     /// Restore a Pmem device from snapshot state with pre-created queues.
-    pub fn from_state(vm: &Vm, state: &PmemState, queues: Vec<Queue>) -> Result<Self, PmemError> {
+    pub fn from_state(
+        vm: Arc<Vm>,
+        state: &PmemState,
+        queues: Vec<Queue>,
+    ) -> Result<Self, PmemError> {
         let mmap = PmemMmap::new(&state.config.path_on_host, state.config.read_only)?;
+        let flags = if state.config.read_only {
+            KVM_MEM_READONLY
+        } else {
+            0
+        };
+        let kvm_mem_slot = KvmMemSlot::new(
+            vm,
+            state.config_space.start,
+            state.config_space.size,
+            mmap.mmap_ptr,
+            flags,
+        )?;
 
-        let mut pmem = Self {
+        Ok(Self {
             avail_features: state.virtio_state.avail_features,
             acked_features: state.virtio_state.acked_features,
             activate_event: EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?,
@@ -239,12 +301,11 @@ impl Pmem {
             queues,
             queue_events: vec![EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?],
             config_space: state.config_space,
+            mmap,
+            kvm_mem_slot,
             metrics: PmemMetricsPerDevice::alloc(state.config.id.clone()),
             config: state.config.clone(),
-            mmap,
-        };
-        pmem.set_mem_region(vm)?;
-        Ok(pmem)
+        })
     }
 
     /// Allocate memory in past_mmio64 memory region
@@ -256,25 +317,6 @@ impl Pmem {
             .allocate(size, Pmem::ALIGNMENT, AllocPolicy::FirstMatch)
             .map_err(|_| PmemError::AllocationFailed)?;
         Ok(addr.start())
-    }
-
-    /// Set user memory region in KVM
-    fn set_mem_region(&mut self, vm: &Vm) -> Result<(), PmemError> {
-        let next_slot = vm.next_kvm_slot(1).ok_or(PmemError::NoKvmSlotAvailable)?;
-        let memory_region = kvm_userspace_memory_region {
-            slot: next_slot,
-            guest_phys_addr: self.config_space.start,
-            memory_size: self.config_space.size,
-            userspace_addr: self.mmap.mmap_ptr,
-            flags: if self.config.read_only {
-                KVM_MEM_READONLY
-            } else {
-                0
-            },
-        };
-
-        vm.set_user_memory_region(memory_region)
-            .map_err(PmemError::SetUserMemoryRegion)
     }
 
     pub fn handle_queue(&mut self) -> Result<(), PmemError> {
@@ -453,7 +495,7 @@ mod tests {
     #[test]
     fn test_from_config() {
         let kvm = Kvm::new(vec![]).unwrap();
-        let vm = Vm::new(&kvm).unwrap();
+        let vm = Arc::new(Vm::new(&kvm).unwrap());
 
         let config = PmemConfig {
             id: "1".into(),
@@ -462,7 +504,7 @@ mod tests {
             read_only: false,
         };
         assert!(matches!(
-            Pmem::new(&vm, config).unwrap_err(),
+            Pmem::new(Arc::clone(&vm), config).unwrap_err(),
             PmemError::BackingFile(_),
         ));
 
@@ -475,7 +517,7 @@ mod tests {
             read_only: false,
         };
         assert!(matches!(
-            Pmem::new(&vm, config).unwrap_err(),
+            Pmem::new(Arc::clone(&vm), config).unwrap_err(),
             PmemError::BackingFileZeroSize,
         ));
 
@@ -486,13 +528,13 @@ mod tests {
             root_device: true,
             read_only: false,
         };
-        Pmem::new(&vm, config).unwrap();
+        Pmem::new(Arc::clone(&vm), config).unwrap();
     }
 
     #[test]
     fn test_process_chain() {
         let kvm = Kvm::new(vec![]).unwrap();
-        let vm = Vm::new(&kvm).unwrap();
+        let vm = Arc::new(Vm::new(&kvm).unwrap());
 
         let dummy_file = TempFile::new().unwrap();
         dummy_file.as_file().set_len(0x20_0000);
@@ -503,7 +545,7 @@ mod tests {
             root_device: true,
             read_only: false,
         };
-        let mut pmem = Pmem::new(&vm, config).unwrap();
+        let mut pmem = Pmem::new(Arc::clone(&vm), config).unwrap();
 
         let mem = default_mem();
         let interrupt = default_interrupt();
