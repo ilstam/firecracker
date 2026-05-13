@@ -1074,7 +1074,9 @@ impl VirtioDevice for Net {
     }
 
     fn _reset(&mut self) -> bool {
-        false
+        self.rx_buffer.clear();
+        self.tx_buffer.clear();
+        true
     }
 
     /// Prepare saving state
@@ -2537,5 +2539,17 @@ pub mod tests {
         let queues = net.queues();
         assert!(queues[RX_INDEX].uses_notif_suppression);
         assert!(queues[TX_INDEX].uses_notif_suppression);
+    }
+
+    #[test]
+    fn test_reset() {
+        let mem = single_region_mem(2 * MAX_BUFFER_SIZE);
+        let mut th = TestHelper::get_default(&mem);
+        th.activate_net();
+
+        assert!(th.net().is_activated());
+        assert!(th.net().reset());
+        assert!(!th.net().is_activated());
+        assert_eq!(th.net().acked_features(), 0);
     }
 }
