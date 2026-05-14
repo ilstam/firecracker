@@ -102,7 +102,9 @@ impl VsockEpollListener for TestBackend {
         self.evset = Some(evset);
     }
 }
-impl VsockBackend for TestBackend {}
+impl VsockBackend for TestBackend {
+    fn reset(&mut self) {}
+}
 
 #[derive(Debug)]
 pub struct TestContext {
