@@ -984,7 +984,9 @@ impl VirtioDevice for Balloon {
     }
 
     fn _reset(&mut self) -> bool {
-        false
+        self.stats_desc_index = None;
+        self.hinting_state = Default::default();
+        true
     }
 
     fn kick(&mut self) {
