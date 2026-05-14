@@ -661,7 +661,7 @@ impl VirtioDevice for VirtioMem {
     }
 
     fn _reset(&mut self) -> bool {
-        false
+        true
     }
 
     fn activate(
