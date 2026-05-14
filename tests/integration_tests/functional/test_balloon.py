@@ -622,3 +622,34 @@ def test_memory_scrub(uvm_plain_any, method):
 
     microvm.ssh.check_output("/usr/local/bin/readmem {} {}".format(60, 1))
     check_guest_dmesg_for_stalls(microvm.ssh)
+
+
+def test_device_reset(uvm_plain_any):
+    """
+    Test that virtio-balloon device reset works.
+    """
+    vm = uvm_plain_any
+    vm.spawn()
+    vm.basic_config()
+    vm.add_net_iface()
+    vm.api.balloon.put(amount_mib=0, deflate_on_oom=False, stats_polling_interval_s=0)
+    vm.start()
+
+    # Find the virtio balloon device.
+    virtio_dev = vm.ssh.check_output(
+        "ls -d /sys/bus/virtio/drivers/virtio_balloon/virtio* | xargs -n1 basename"
+    ).stdout.strip()
+
+    vm.ssh.check_output(
+        f"echo {virtio_dev} > /sys/bus/virtio/drivers/virtio_balloon/unbind"
+    )
+
+    # Verify the balloon is gone.
+    ret = vm.ssh.run("ls /sys/bus/virtio/drivers/virtio_balloon/virtio*")
+    assert ret.returncode != 0
+
+    # Rebind and verify it's back.
+    vm.ssh.check_output(
+        f"echo {virtio_dev} > /sys/bus/virtio/drivers/virtio_balloon/bind"
+    )
+    vm.ssh.check_output("ls /sys/bus/virtio/drivers/virtio_balloon/virtio*")
