@@ -11,7 +11,7 @@ use super::persist::{BlockConstructorArgs, BlockState};
 use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
-use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::device::{DeviceState, VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
@@ -204,6 +204,13 @@ impl VirtioDevice for Block {
         match self {
             Self::Virtio(b) => b.device_state.is_activated(),
             Self::VhostUser(b) => b.device_state.is_activated(),
+        }
+    }
+
+    fn deactivate(&mut self) {
+        match self {
+            Self::Virtio(b) => b.device_state = DeviceState::Inactive,
+            Self::VhostUser(b) => b.device_state = DeviceState::Inactive,
         }
     }
 
