@@ -182,10 +182,19 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
     fn deactivate(&mut self);
 
     /// Reset the device. Returns true on success, false otherwise.
+    /// It must not be overridden.
     fn reset(&mut self) -> bool {
+        self.deactivate();
+        self.set_acked_features(0);
         for queue in self.queues_mut() {
             *queue = Queue::new(queue.max_size);
         }
+        self._reset()
+    }
+
+    /// Backend-specific reset logic. Override this to reset device-specific
+    /// state. Returns true on success, false otherwise.
+    fn _reset(&mut self) -> bool {
         false
     }
 
