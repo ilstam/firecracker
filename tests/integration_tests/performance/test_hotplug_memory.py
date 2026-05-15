@@ -503,3 +503,37 @@ def test_memory_hotplug_latency(
         timed_memory_hotplug(uvm, 0, metrics, "hotunplug", "unplug_agg")
         timed_memory_hotplug(uvm, hotplug_size, metrics, "hotplug_2nd", "plug_agg")
         uvm.kill()
+
+
+def test_device_reset(uvm_plain_6_1):
+    """
+    Test that virtio-mem device reset works and preserves hotplugged memory.
+    """
+    config = {"total_size_mib": 1024, "slot_size_mib": 128, "block_size_mib": 2}
+    uvm = uvm_booted_memhp(uvm_plain_6_1, None, None, False, config, None, None, None)
+
+    # Hotplug 256 MiB before reset.
+    check_hotplug(uvm, 256)
+
+    meminfo = MeminfoGuest(uvm)
+    mem_total_before = meminfo.get().mem_total.mib()
+
+    # Reset the device via driver unbind/bind.
+    virtio_dev = uvm.ssh.check_output(
+        "ls -d /sys/bus/virtio/drivers/virtio_mem/virtio* | xargs -n1 basename"
+    ).stdout.strip()
+
+    uvm.ssh.check_output(
+        f"echo {virtio_dev} > /sys/bus/virtio/drivers/virtio_mem/unbind"
+    )
+    uvm.ssh.check_output(
+        f"echo {virtio_dev} > /sys/bus/virtio/drivers/virtio_mem/bind"
+    )
+
+    # Verify hotplugged memory is still present after reset.
+    mem_total_after = meminfo.get().mem_total.mib()
+    assert mem_total_after == mem_total_before
+
+    # Verify the device is still functional by hotplugging more memory.
+    # check_hotplug() asserts that guest mem_total reflects the new size.
+    check_hotplug(uvm, 512)
