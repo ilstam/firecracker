@@ -199,6 +199,28 @@ impl Bus {
         Ok(())
     }
 
+    /// Relocate an existing device mapping from `old_base` to `new_base`,
+    pub fn move_range(&self, old_base: u64, new_base: u64, len: u64) -> Result<(), BusError> {
+        let old_range = BusRange::new(old_base, len)?;
+        let new_range = BusRange::new(new_base, len)?;
+
+        let mut devices = self.devices.write().unwrap();
+
+        // Remove first because the new range might overlap the old range
+        let dev = devices
+            .remove(&old_range)
+            .ok_or(BusError::MissingAddressRange)?;
+
+        // Reject if the destination overlaps another device
+        if devices.iter().any(|(range, _)| range.overlaps(&new_range)) {
+            devices.insert(old_range, dev);
+            return Err(BusError::Overlap);
+        }
+
+        devices.insert(new_range, dev);
+        Ok(())
+    }
+
     /// Reads data from the device that owns the range containing `addr` and puts it into `data`.
     ///
     /// Returns true on success, otherwise `data` is untouched.
@@ -326,6 +348,41 @@ mod tests {
         bus.insert(dummy.clone(), 0x13, 0x12).unwrap();
         bus.remove(0x42, 0x42).unwrap_err();
         bus.remove(0x13, 0x12).unwrap();
+    }
+
+    #[test]
+    fn bus_move_range() {
+        let bus = Bus::new();
+        let dev = Arc::new(ConstantDevice);
+        bus.insert(dev.clone(), 0x10, 0x10).unwrap();
+
+        // Moving a range that is not registered fails and leaves the bus untouched.
+        assert!(matches!(
+            bus.move_range(0x2000, 0x3000, 0x10),
+            Err(BusError::MissingAddressRange)
+        ));
+
+        // The device is reachable at its original base but not at the target.
+        bus.read(0x10, &mut [0; 4]).unwrap();
+        bus.read(0x30, &mut [0; 4]).unwrap_err();
+
+        // Relocate the mapping; reads now resolve at the new base and the
+        // ConstantDevice still answers relative to the (new) range base.
+        bus.move_range(0x10, 0x30, 0x10).unwrap();
+        bus.read(0x10, &mut [0; 4]).unwrap_err();
+        let mut values = [0, 1, 2, 3];
+        bus.read(0x35, &mut values).unwrap();
+        assert_eq!(values, [5, 6, 7, 8]);
+
+        // A move onto a range occupied by another device is rejected, and the
+        // source mapping is left in place so nothing is lost.
+        bus.insert(dev.clone(), 0x10, 0x10).unwrap();
+        assert!(matches!(
+            bus.move_range(0x30, 0x18, 0x10),
+            Err(BusError::Overlap)
+        ));
+        bus.read(0x35, &mut [0; 4]).unwrap();
+        bus.read(0x15, &mut [0; 4]).unwrap();
     }
 
     #[test]
