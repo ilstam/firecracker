@@ -44,7 +44,6 @@ use crate::pci::{
 use crate::snapshot::Persist;
 use crate::vstate::bus::BusDevice;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
-use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
 
 /// Vector value used to disable MSI for a queue.
@@ -228,6 +227,11 @@ const MSIX_PBA_SIZE: u32 = 0x800;
 /// The BAR size must be a power of 2.
 pub const CAPABILITY_BAR_SIZE: u64 = 0x80000;
 
+/// PCI configuration register index of the Command/Status DWORD.
+const COMMAND_REG: u16 = 1;
+/// Command register "Memory Space Enable" bit
+const COMMAND_MEMORY_SPACE_ENABLE: u32 = 0x0000_0002;
+
 const NOTIFY_OFF_MULTIPLIER: u32 = 4; // A dword per notification address.
 
 const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
@@ -280,8 +284,7 @@ pub struct VirtioPciDevice {
     // PCI interrupts.
     virtio_interrupt: Option<Arc<VirtioInterruptMsix>>,
 
-    // Guest memory
-    memory: GuestMemoryMmap,
+    vm: Arc<KvmVm>,
 
     // GPA base at which the capability BAR is currently mapped on the
     // mmio bus, and where the notification ioeventfds are registered.
@@ -375,7 +378,7 @@ impl VirtioPciDevice {
     /// Constructs a new PCI transport for the given virtio device.
     pub fn new(
         id: String,
-        memory: GuestMemoryMmap,
+        vm: &Arc<KvmVm>,
         device: Arc<Mutex<dyn VirtioDevice>>,
         msix_vectors: Arc<MsixVectorGroup>,
         sbdf: PciSBDF,
@@ -413,7 +416,7 @@ impl VirtioPciDevice {
             device,
             device_activated: Arc::new(AtomicBool::new(false)),
             virtio_interrupt: Some(interrupt),
-            memory,
+            vm: vm.clone(),
             bar_address: 0,
             cap_pci_cfg_info: VirtioPciCfgCapInfo::default(),
             bars: Bars::default(),
@@ -474,7 +477,7 @@ impl VirtioPciDevice {
             device,
             device_activated: Arc::new(AtomicBool::new(state.device_activated)),
             virtio_interrupt: Some(interrupt),
-            memory: vm.guest_memory().clone(),
+            vm: vm.clone(),
             bar_address: 0,
             cap_pci_cfg_info,
             bars: state.bars,
@@ -490,7 +493,7 @@ impl VirtioPciDevice {
                 .lock()
                 .expect("Poisoned lock")
                 .activate(
-                    virtio_pci_device.memory.clone(),
+                    virtio_pci_device.vm.guest_memory().clone(),
                     virtio_pci_device.virtio_interrupt.as_ref().unwrap().clone(),
                 );
         }
@@ -669,6 +672,41 @@ impl VirtioPciDevice {
             }
         }
         Ok(())
+    }
+
+    /// React to a guest write of the command register. Once the guest enables
+    /// memory-space decoding, the BAR holds its final address; if that address
+    /// differs from where the capability BAR is currently mapped, relocate the
+    /// mmio_bus mapping and the notification ioeventfds to follow it.
+    fn maybe_relocate_bar(&mut self) {
+        if self.configuration.read_reg(COMMAND_REG) & COMMAND_MEMORY_SPACE_ENABLE == 0 {
+            return;
+        }
+        let old_base = self.bar_address;
+        let new_base = self.config_bar_addr();
+        if new_base == old_base {
+            return;
+        }
+
+        let vm = self.vm.clone();
+        if let Err(err) = vm
+            .common
+            .mmio_bus
+            .move_range(old_base, new_base, CAPABILITY_BAR_SIZE)
+        {
+            error!("Failed to relocate BAR mapping {old_base:#x} -> {new_base:#x}: {err:?}");
+            return;
+        }
+
+        if let Err(err) = self.set_notification_ioevents(&vm, old_base, false) {
+            error!("Failed to remove notification ioeventfds at {old_base:#x}: {err:?}");
+        }
+        if let Err(err) = self.set_notification_ioevents(&vm, new_base, true) {
+            error!("Failed to add notification ioeventfds at {new_base:#x}: {err:?}");
+        }
+
+        self.bar_address = new_base;
+        debug!("Relocated virtio-pci BAR mapping {old_base:#x} -> {new_base:#x}");
     }
 
     /// Register the IoEvent notifications for a VirtIO device.
@@ -890,6 +928,9 @@ impl PciDevice for VirtioPciDevice {
         } else {
             self.configuration
                 .write_config_register(reg_idx, offset, data);
+            if reg_idx == COMMAND_REG {
+                self.maybe_relocate_bar();
+            }
             None
         }
     }
@@ -1046,7 +1087,7 @@ impl PciDevice for VirtioPciDevice {
             let interrupt = Arc::clone(self.virtio_interrupt.as_ref().unwrap());
             let device = self.virtio_device();
             let mut locked_device = device.lock().unwrap();
-            match locked_device.activate(self.memory.clone(), interrupt.clone()) {
+            match locked_device.activate(self.vm.guest_memory().clone(), interrupt.clone()) {
                 Ok(()) => {
                     self.device_activated.store(true, Ordering::SeqCst);
 
