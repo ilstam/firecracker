@@ -283,6 +283,15 @@ pub struct VirtioPciDevice {
     // Guest memory
     memory: GuestMemoryMmap,
 
+    // GPA base at which the capability BAR is currently mapped on the
+    // mmio bus, and where the notification ioeventfds are registered.
+    //
+    // It is not necessarily equal to `config_bar_addr()`: the latter reflects
+    // whatever the guest has last written into the BAR registers, which may be
+    // transient (a 64-bit BAR is programmed with two separate writes) or not
+    // yet in effect.
+    bar_address: u64,
+
     // Add a dedicated structure to hold information about the very specific
     // virtio-pci capability VIRTIO_PCI_CAP_PCI_CFG. This is needed to support
     // the legacy/backward compatible mechanism of letting the guest access the
@@ -359,6 +368,7 @@ impl VirtioPciDevice {
             CAPABILITY_BAR_SIZE,
             BarPrefetchable::No,
         );
+        self.bar_address = virtio_pci_bar_addr;
         self.add_pci_capabilities();
     }
 
@@ -404,6 +414,7 @@ impl VirtioPciDevice {
             device_activated: Arc::new(AtomicBool::new(false)),
             virtio_interrupt: Some(interrupt),
             memory,
+            bar_address: 0,
             cap_pci_cfg_info: VirtioPciCfgCapInfo::default(),
             bars: Bars::default(),
             msix_config,
@@ -464,11 +475,14 @@ impl VirtioPciDevice {
             device_activated: Arc::new(AtomicBool::new(state.device_activated)),
             virtio_interrupt: Some(interrupt),
             memory: vm.guest_memory().clone(),
+            bar_address: 0,
             cap_pci_cfg_info,
             bars: state.bars,
             msix_config,
             msix_config_cap_offset: state.msix_config_cap_offset,
         };
+
+        virtio_pci_device.bar_address = virtio_pci_device.config_bar_addr();
 
         if state.device_activated {
             virtio_pci_device
@@ -494,8 +508,19 @@ impl VirtioPciDevice {
         self.common_config.driver_status == INIT
     }
 
+    /// GPA base currently written in the BAR register.
+    ///
+    /// Might be different from bar_address() during BAR relocation.
     pub fn config_bar_addr(&self) -> u64 {
         self.bars.get_bar_addr_64(VIRTIO_BAR_INDEX)
+    }
+
+    /// GPA base at which the capability BAR is currently mapped on the
+    /// mmio bus, and where the notification ioeventfds are registered.
+    ///
+    /// Might be different from config_bar_addr() during BAR relocation.
+    pub fn bar_address(&self) -> u64 {
+        self.bar_address
     }
 
     fn add_pci_capabilities(&mut self) {
@@ -648,12 +673,12 @@ impl VirtioPciDevice {
 
     /// Register the IoEvent notifications for a VirtIO device.
     pub fn register_notification_ioevents(&self, vm: &KvmVm) -> Result<(), errno::Error> {
-        self.set_notification_ioevents(vm, self.config_bar_addr(), true)
+        self.set_notification_ioevents(vm, self.bar_address, true)
     }
 
     /// Unregister the IoEvent notifications for a VirtIO device.
     pub fn unregister_notification_ioevents(&self, vm: &KvmVm) -> Result<(), errno::Error> {
-        self.set_notification_ioevents(vm, self.config_bar_addr(), false)
+        self.set_notification_ioevents(vm, self.bar_address, false)
     }
 
     /// Tear down the MSI-X configuration. Used on device reset.

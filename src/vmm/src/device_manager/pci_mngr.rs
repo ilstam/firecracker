@@ -88,12 +88,12 @@ impl PciDevices {
 
         debug!(
             "Inserting MMIO BAR region: {:#x}:{:#x}",
-            virtio_device_locked.config_bar_addr(),
+            virtio_device_locked.bar_address(),
             CAPABILITY_BAR_SIZE
         );
         vm.common.mmio_bus.insert(
             virtio_device.clone(),
-            virtio_device_locked.config_bar_addr(),
+            virtio_device_locked.bar_address(),
             CAPABILITY_BAR_SIZE,
         )?;
 
@@ -195,7 +195,7 @@ impl PciDevices {
 
         vm.common
             .mmio_bus
-            .remove(pci_device.config_bar_addr(), CAPABILITY_BAR_SIZE)
+            .remove(pci_device.bar_address(), CAPABILITY_BAR_SIZE)
             .map_err(PciManagerError::Bus)?;
 
         self.pci_segment
