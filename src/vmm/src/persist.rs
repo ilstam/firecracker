@@ -433,6 +433,15 @@ pub fn restore_from_snapshot(
         .map_err(|_| MachineConfigError::InvalidVcpuCount)
         .map_err(BuildMicrovmFromSnapshotError::VmUpdateConfig)?;
 
+    // Due to questionable past API design decisions whether the restored VM
+    // uses PCI is decided by the snapshot and not by the --enable-pci flag of
+    // the process doing the restore. Set the option based on the snapshot
+    // state.
+    vm_resources.pci_enabled = matches!(
+        microvm_state.device_states.virtio_state,
+        VirtioDevicesState::Pci(_)
+    );
+
     vm_resources
         .update_machine_config(&MachineConfigUpdate {
             vcpu_count: Some(vcpu_count),
