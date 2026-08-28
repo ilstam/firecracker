@@ -826,6 +826,29 @@ def wait_for_tcp_port_on_guest(vm, port, timeout=5.0):
             assert exit_code == 0, f"Port {port} not open on guest"
 
 
+def wait_for_pci_devices(vm, expected, timeout=30.0):
+    """Poll until the guest reports exactly `expected` PCI devices.
+
+    Native PCIe hot-plug is asynchronous: the API call returns before the
+    guest's pciehp driver has bound the new device or released a removed one.
+    A managed removal is slower still, because Linux waits five seconds after
+    the attention button press before acting on it.
+
+    Returns the set of lspci lines.
+    """
+    for attempt in Retrying(
+        wait=wait_fixed(0.2), stop=stop_after_delay(timeout), reraise=True
+    ):
+        with attempt:
+            _, lspci, _ = vm.ssh.check_output("lspci -n")
+            devices = set(lspci.splitlines())
+            assert (
+                len(devices) == expected
+            ), f"guest sees {len(devices)} PCI devices, expected {expected}:\n{lspci}"
+            return devices
+    raise AssertionError("unreachable")
+
+
 def kill_and_wait_on_host(process_name, timeout=5.0):
     """Kills the given process on the host, and waits for its termination via waitpid"""
     exit_code, pid, _ = run_cmd(["pgrep", process_name])
