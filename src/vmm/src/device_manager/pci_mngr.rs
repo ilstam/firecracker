@@ -34,7 +34,7 @@ use crate::devices::virtio::vsock::persist::{
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::logger::{debug, warn};
 use crate::pci::PciSBDF;
-use crate::pci::bus::PciBusError;
+use crate::pci::bus::{PciBus, PciBusError};
 use crate::resources::VmResources;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -42,6 +42,17 @@ use crate::vstate::bus::BusError;
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
+
+/// Where on the PCI topology a virtio device should be placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PciPlacement {
+    /// Directly on the root bus. The device is part of the topology the guest
+    /// enumerates at boot and cannot be removed.
+    RootBus,
+    /// In the slot of a free PCIe Root Port, which is what makes a device
+    /// hot-pluggable and hot-unpluggable.
+    RootPort,
+}
 
 #[derive(Debug)]
 pub struct PciDevices {
@@ -65,6 +76,10 @@ pub enum PciManagerError {
     VirtioPciDevice(#[from] VirtioPciDeviceError),
     /// KVM error: {0}
     Kvm(#[from] vmm_sys_util::errno::Error),
+    /// No PCIe Root Port is free. Every configured Root Port already has a
+    /// device in it; raise `pcie_hotplug_ports` in the machine configuration to
+    /// allow more hot-plugged devices.
+    NoFreeRootPort,
 }
 
 impl PciDevices {
@@ -82,9 +97,9 @@ impl PciDevices {
     fn attach_common(
         &mut self,
         vm: &KvmVm,
-        device_type: VirtioDeviceType,
-        id: String,
+        device_id: VirtioDeviceId,
         sbdf: PciSBDF,
+        bus: &Arc<Mutex<PciBus>>,
         virtio_device: Arc<Mutex<VirtioPciDevice>>,
         event_manager: &mut EventManager,
     ) -> Result<(), PciManagerError> {
@@ -99,13 +114,9 @@ impl PciDevices {
             device.bar_address()
         };
 
-        self.virtio_devices
-            .insert((device_type, id), virtio_device.clone());
+        self.virtio_devices.insert(device_id, virtio_device.clone());
 
-        self.pci_segment
-            .pci_buses
-            .root_bus()
-            .lock()
+        bus.lock()
             .expect("Poisoned lock")
             .add_device(sbdf.device(), virtio_device.clone())?;
 
@@ -126,8 +137,23 @@ impl PciDevices {
         id: String,
         device: Arc<Mutex<dyn VirtioDevice>>,
         event_manager: &mut EventManager,
+        placement: PciPlacement,
     ) -> Result<(), PciManagerError> {
-        let sbdf = self.pci_segment.next_device_sbdf()?;
+        // A Root Port's slot holds a single device, at device 0 of the
+        // secondary bus the port starts.
+        let (sbdf, bus, root_port) = match placement {
+            PciPlacement::RootBus => (
+                self.pci_segment.next_device_sbdf()?,
+                self.pci_segment.pci_buses.root_bus(),
+                None,
+            ),
+            PciPlacement::RootPort => {
+                let (port, bus) = self.pci_segment.allocate_root_port()?;
+                let secondary_bus = port.lock().expect("Poisoned lock").secondary_bus();
+                let sbdf = PciSBDF::new(self.pci_segment.id, secondary_bus, 0, 0);
+                (sbdf, bus, Some(port))
+            }
+        };
         debug!("Allocating SBDF: {sbdf:?} for device");
 
         let device_type = device.lock().expect("Poisoned lock").device_type();
@@ -142,14 +168,38 @@ impl PciDevices {
         let mut virtio_device =
             VirtioPciDevice::new(id.clone(), vm, device, Arc::new(msix_vectors), sbdf);
 
+        // Placing the BAR inside the window the guest reserved for the port
+        // saves it from having to relocate the BAR, and keeps us from handing
+        // out an address that the guest is about to assign to a device behind
+        // another port. There is no window yet for a device placed behind a
+        // port at boot, which is fine: Linux sizes the window around it.
+        let port_window = root_port
+            .as_ref()
+            .and_then(|port| port.lock().expect("Poisoned lock").nonpref_memory_window());
+
         // Don't hold the resource allocator lock across attach_common()
         // below: a device access holds the bus lock and can take the allocator
         // lock, so the reverse order can deadlock.
-        virtio_device.allocate_bars(&mut vm.resource_allocator().mmio32_memory);
+        virtio_device.allocate_bars(&mut vm.resource_allocator().mmio32_memory, port_window);
 
         let virtio_device = Arc::new(Mutex::new(virtio_device));
 
-        self.attach_common(vm, device_type, id, sbdf, virtio_device, event_manager)
+        self.attach_common(
+            vm,
+            (device_type, id),
+            sbdf,
+            &bus,
+            virtio_device,
+            event_manager,
+        )?;
+
+        // Only tell the guest about the insertion once the device can answer
+        // the enumeration it will trigger.
+        if let Some(port) = root_port {
+            port.lock().expect("Poisoned lock").plug(true);
+        }
+
+        Ok(())
     }
 
     pub(crate) fn pci_segment(&self) -> &PciSegment {
@@ -182,17 +232,28 @@ impl PciDevices {
             .remove(&device_id)
             .expect("device presence should be checked before detach");
 
-        let sbdf_device = pci_device_arc.lock().expect("Poisoned lock").sbdf.device();
+        let sbdf = pci_device_arc.lock().expect("Poisoned lock").sbdf;
 
-        // Remove the device from the PCI bus first. A config space access runs
-        // with the PCI bus lock held and can relocate the BAR, so afterwards
-        // the BAR address of the device can no longer change under us.
+        // Tell the guest the slot is empty before taking the device away, so
+        // that its first observation of the removal is the truthful one rather
+        // than a device that has stopped answering. The guest handles the event
+        // asynchronously, so it may still touch the device for a while; the
+        // managed removal flow closes that window.
+        if let Some(port) = self.pci_segment.root_port_for_bus(sbdf.bus()) {
+            port.lock().expect("Poisoned lock").eject();
+        }
+
+        // Remove the device from the bus it is on -- a Root Port's secondary
+        // bus if it was hot-plugged -- first. A config space access runs with
+        // the PCI bus lock held and can relocate the BAR, so afterwards the BAR
+        // address of the device can no longer change under us.
         self.pci_segment
             .pci_buses
-            .root_bus()
+            .get(sbdf.bus())
+            .ok_or_else(|| PciBusError::InvalidBusNumber(sbdf.bus()))?
             .lock()
             .expect("Poisoned lock")
-            .remove_device(sbdf_device);
+            .remove_device(sbdf.device());
 
         // Next operations of removing device from mmio_bus and pci_bus need to wait for any other
         // user of the device to finish. This requires us to not hold the lock for the device in
@@ -246,11 +307,19 @@ impl PciDevices {
             transport_state.clone(),
         )?));
 
+        // Restore the device onto the bus it was snapshotted on, which is a
+        // Root Port's secondary bus if it was hot-pluggable.
+        let bus = self
+            .pci_segment
+            .pci_buses
+            .get(transport_state.sbdf.bus())
+            .ok_or_else(|| PciBusError::InvalidBusNumber(transport_state.sbdf.bus()))?;
+
         self.attach_common(
             vm,
-            device_type,
-            device_id.to_string(),
+            (device_type, device_id.to_string()),
             transport_state.sbdf,
+            &bus,
             virtio_device,
             event_manager,
         )?;

@@ -346,22 +346,63 @@ impl VirtioPciDevice {
         )
     }
 
-    /// Allocate the PCI BAR for the VirtIO device and its associated capabilities.
+    /// Pick the guest address for the virtio-pci capability BAR.
     ///
-    /// This must happen only during the creation of a brand new VM. When a VM is restored from a
-    /// known state, the BARs are already created with the right content, therefore we don't need
-    /// to go through this codepath.
-    pub fn allocate_bars(&mut self, allocator: &mut AddressAllocator) {
-        // Allocate the virtio-pci capability BAR.
-        // See http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-740004
-        self.bar_address = allocator
+    /// A Root Port hosts a single device, so the whole of its memory window is
+    /// available and the BAR goes at the base. Anything unexpected -- no
+    /// window, a BAR too big for it, or the range already taken -- falls back
+    /// to the general 32-bit MMIO window, which is the behaviour we had before
+    /// and leaves the guest free to relocate the BAR itself.
+    fn allocate_bar_address(allocator: &mut AddressAllocator, window: Option<(u64, u64)>) -> u64 {
+        if let Some((base, limit)) = window {
+            let fits = base
+                .checked_add(CAPABILITY_BAR_SIZE - 1)
+                .is_some_and(|end| end <= limit);
+            if fits {
+                match allocator.allocate(
+                    CAPABILITY_BAR_SIZE,
+                    CAPABILITY_BAR_SIZE,
+                    AllocPolicy::ExactMatch(base),
+                ) {
+                    Ok(range) => return range.start(),
+                    Err(err) => warn!(
+                        "Cannot place the virtio-pci BAR at {base:#x} in the Root Port memory \
+                         window: {err:?}"
+                    ),
+                }
+            } else {
+                warn!(
+                    "The Root Port memory window {base:#x}-{limit:#x} is too small for the \
+                     virtio-pci BAR"
+                );
+            }
+        }
+
+        allocator
             .allocate(
                 CAPABILITY_BAR_SIZE,
                 CAPABILITY_BAR_SIZE,
                 AllocPolicy::FirstMatch,
             )
             .unwrap()
-            .start();
+            .start()
+    }
+
+    /// Allocate the PCI BAR for the VirtIO device and its associated capabilities.
+    ///
+    /// `window` is the memory window of the Root Port the device is being
+    /// plugged into, when the guest has already programmed one. Placing the BAR
+    /// inside it means the guest finds the BAR where it expects and claims it
+    /// as-is, instead of assigning a different address that we would then have
+    /// to relocate to.
+    ///
+    /// This must happen only during the creation of a brand new VM. When a VM is restored from a
+    /// known state, the BARs are already created with the right content, therefore we don't need
+    /// to go through this codepath.
+    pub fn allocate_bars(&mut self, allocator: &mut AddressAllocator, window: Option<(u64, u64)>) {
+        // Allocate the virtio-pci capability BAR.
+        // See http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-740004
+        self.bar_address = Self::allocate_bar_address(allocator, window);
         self.bars.set_bar_64(
             VIRTIO_BAR_INDEX,
             self.bar_address,
@@ -1228,7 +1269,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use linux_loader::loader::Cmdline;
-    use vm_allocator::{AllocPolicy, RangeInclusive};
+    use vm_allocator::{AddressAllocator, AllocPolicy, RangeInclusive};
     use vm_memory::{ByteValued, Le32};
 
     use super::{EventFd, IoEventAddress, KvmVm, NoDatamatch, PciCapabilityType, VirtioPciDevice};
@@ -1436,6 +1477,38 @@ mod tests {
 
         // We create a capabilities BAR region of 0x80000 bytes
         assert_eq!(bar_size, 0x80000);
+    }
+
+    #[test]
+    fn test_bar_address_prefers_the_root_port_window() {
+        let mut allocator = AddressAllocator::new(0xc000_0000, 0x1000_0000).unwrap();
+        let window = Some((0xc020_0000, 0xc03f_ffff));
+
+        // With no window we take the bottom of the pool, as we always have.
+        assert_eq!(
+            VirtioPciDevice::allocate_bar_address(&mut allocator, None),
+            0xc000_0000
+        );
+
+        // With a window we take its base, which is where the guest expects the
+        // BAR of the single device behind the port to be.
+        assert_eq!(
+            VirtioPciDevice::allocate_bar_address(&mut allocator, window),
+            0xc020_0000
+        );
+
+        // That base is now taken, so a second device claiming the same window
+        // falls back to the pool rather than failing.
+        assert_ne!(
+            VirtioPciDevice::allocate_bar_address(&mut allocator, window),
+            0xc020_0000
+        );
+
+        // A window too small to hold the BAR is ignored.
+        assert_ne!(
+            VirtioPciDevice::allocate_bar_address(&mut allocator, Some((0xc100_0000, 0xc100_ffff))),
+            0xc100_0000
+        );
     }
 
     fn kvm_vm(vmm: &Vmm) -> &Arc<KvmVm> {

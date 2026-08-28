@@ -25,10 +25,13 @@ use crate::pci::PciSBDF;
 #[cfg(target_arch = "x86_64")]
 use crate::pci::bus::{PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE, PciConfigIo};
 use crate::pci::bus::{
-    PCI_MMIO_CONFIG_SIZE_PER_SEGMENT, PciBusError, PciBuses, PciConfigMmio, PciHostBridge,
+    PCI_MMIO_CONFIG_SIZE_PER_SEGMENT, PciBus, PciBusError, PciBuses, PciConfigMmio, PciHostBridge,
 };
 use crate::vstate::bus::BusError;
 use crate::vstate::vm::KvmVm;
+
+/// A Root Port and the secondary bus it starts.
+pub(crate) type RootPortSlot = (Arc<Mutex<PciRootPort>>, Arc<Mutex<PciBus>>);
 
 pub struct PciSegment {
     pub(crate) id: u16,
@@ -222,6 +225,38 @@ impl PciSegment {
         }
 
         Ok(())
+    }
+
+    /// Find a Root Port with an empty slot and return it together with its
+    /// secondary bus.
+    pub(crate) fn allocate_root_port(&self) -> Result<RootPortSlot, PciManagerError> {
+        for port in &self.root_ports {
+            let secondary_bus = port.lock().expect("Poisoned lock").secondary_bus();
+            let bus = self
+                .pci_buses
+                .get(secondary_bus)
+                .expect("a Root Port's secondary bus is created with the segment");
+            // A Root Port slot holds at most one device, at device 0 of its
+            // secondary bus.
+            if bus.lock().expect("Poisoned lock").get_device(0).is_none() {
+                return Ok((port.clone(), bus));
+            }
+        }
+
+        Err(PciManagerError::NoFreeRootPort)
+    }
+
+    /// Return the Root Port that starts the given secondary bus, if any.
+    ///
+    /// Root Port `i` starts secondary bus `i + 1` -- a 1:1 mapping fixed at
+    /// provisioning time -- so this is a direct index rather than a search.
+    /// It relies on the guest keeping the bus numbers it was given, which Linux
+    /// does unless asked to reassign all of them (PCI_REASSIGN_ALL_BUS);
+    /// neither an ACPI platform nor a device-tree pci-host-ecam-generic host
+    /// bridge asks for that.
+    pub(crate) fn root_port_for_bus(&self, secondary_bus: u8) -> Option<Arc<Mutex<PciRootPort>>> {
+        let index = usize::from(secondary_bus.checked_sub(1)?);
+        self.root_ports.get(index).cloned()
     }
 
     pub(crate) fn next_device_sbdf(&self) -> Result<PciSBDF, PciBusError> {
