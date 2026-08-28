@@ -282,6 +282,13 @@ impl DeviceManager {
     }
 
     /// Attaches a boot-time VirtioDevice device to the device and event managers.
+    ///
+    /// `placement` decides whether the device goes on the root bus or into a
+    /// Root Port slot, which is what makes it hot-unpluggable. It is ignored
+    /// without PCI, where there are no Root Ports to speak of.
+    // The two transports need different things: MMIO needs the kernel cmdline
+    // and whether the device is vhost-user, PCI needs the placement.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach_boot_virtio_device<
         T: 'static + VirtioDevice + MutEventSubscriber + Debug,
     >(
@@ -292,6 +299,7 @@ impl DeviceManager {
         cmdline: &mut Cmdline,
         event_manager: &mut EventManager,
         is_vhost_user: bool,
+        placement: PciPlacement,
     ) -> Result<(), AttachDeviceError> {
         let vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
         match &mut self.virtio_devices {
@@ -299,7 +307,7 @@ impl DeviceManager {
                 .attach_mmio_virtio_device(vm, id, device, cmdline, event_manager, is_vhost_user)
                 .map_err(AttachDeviceError::from),
             VirtioDevices::Pci(pci_devices) => pci_devices
-                .attach_pci_virtio_device(vm, id, device, event_manager, PciPlacement::RootBus)
+                .attach_pci_virtio_device(vm, id, device, event_manager, placement)
                 .map_err(AttachDeviceError::from),
         }
     }

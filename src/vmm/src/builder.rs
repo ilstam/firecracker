@@ -24,18 +24,20 @@ use crate::construct_kvm_mpidrs;
 use crate::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError, GuestConfigError};
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager;
+use crate::device_manager::pci_mngr::PciPlacement;
 use crate::device_manager::{
     AttachDeviceError, DeviceManager, DeviceManagerCreateError, DeviceManagerPersistError,
     DeviceRestoreArgs,
 };
-use crate::devices::virtio::balloon::Balloon;
+use crate::devices::virtio::balloon::{BALLOON_DEV_ID, Balloon};
 use crate::devices::virtio::block::device::Block;
-use crate::devices::virtio::device::VirtioDevice;
-use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
+use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VIRTIO_MEM_DEV_ID, VirtioMem};
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
-use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
+use crate::devices::virtio::vsock::{VSOCK_DEV_ID, Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
 use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
@@ -226,68 +228,117 @@ pub fn build_microvm_for_boot(
         device_manager.attach_boot_timer_device(&kvm_vm, request_ts)?;
     }
 
-    if let Some(balloon) = vm_resources.balloon.get() {
-        attach_balloon_device(
+    // Boot devices are attached in two passes.
+    //
+    // The first pass takes the devices that stay on the root bus. They get the
+    // low slots, which keeps their guest-visible PCI addresses -- and so the
+    // names the guest derives from them -- independent of what else is
+    // configured. The Root Ports are then attached, taking the slots that
+    // follow. The second pass puts the devices asked to be `removable` into
+    // those ports' slots, which is what makes them hot-unpluggable.
+    for placement in [PciPlacement::RootBus, PciPlacement::RootPort] {
+        if placement == PciPlacement::RootPort {
+            device_manager.attach_root_ports(&kvm_vm)?;
+        }
+
+        let wanted = |device_type, id: &str| {
+            let removable = vm_resources.is_removable(device_type, id);
+            removable == (placement == PciPlacement::RootPort)
+        };
+
+        if let Some(balloon) = vm_resources.balloon.get()
+            && wanted(VirtioDeviceType::Balloon, BALLOON_DEV_ID)
+        {
+            attach_balloon_device(
+                &mut device_manager,
+                &vm,
+                &mut boot_cmdline,
+                balloon,
+                event_manager,
+                placement,
+            )?;
+        }
+
+        attach_block_devices(
             &mut device_manager,
             &vm,
             &mut boot_cmdline,
-            balloon,
+            vm_resources.block.devices.iter().filter(|block| {
+                wanted(
+                    VirtioDeviceType::Block,
+                    block.lock().expect("Poisoned lock").id(),
+                )
+            }),
             event_manager,
+            placement,
         )?;
-    }
-
-    attach_block_devices(
-        &mut device_manager,
-        &vm,
-        &mut boot_cmdline,
-        vm_resources.block.devices.iter(),
-        event_manager,
-    )?;
-    attach_net_devices(
-        &mut device_manager,
-        &vm,
-        &mut boot_cmdline,
-        vm_resources.net_builder.iter(),
-        event_manager,
-    )?;
-    attach_pmem_devices(
-        &mut device_manager,
-        &vm,
-        &mut boot_cmdline,
-        &vm_resources.pmem.configs,
-        event_manager,
-    )?;
-
-    if let Some(unix_vsock) = vm_resources.vsock.get() {
-        attach_unixsock_vsock_device(
+        attach_net_devices(
             &mut device_manager,
             &vm,
             &mut boot_cmdline,
-            unix_vsock,
+            vm_resources.net_builder.iter().filter(|net| {
+                wanted(
+                    VirtioDeviceType::Net,
+                    net.lock().expect("Poisoned lock").id(),
+                )
+            }),
             event_manager,
+            placement,
         )?;
-    }
-
-    if let Some(entropy) = vm_resources.entropy.get() {
-        attach_entropy_device(
+        attach_pmem_devices(
             &mut device_manager,
             &vm,
             &mut boot_cmdline,
-            entropy,
+            &vm_resources
+                .pmem
+                .configs
+                .iter()
+                .filter(|config| wanted(VirtioDeviceType::Pmem, &config.id))
+                .cloned()
+                .collect::<Vec<_>>(),
             event_manager,
+            placement,
         )?;
-    }
 
-    // Attach virtio-mem device if configured
-    if let Some(memory_hotplug) = &vm_resources.memory_hotplug {
-        attach_virtio_mem_device(
-            &mut device_manager,
-            &vm,
-            &mut boot_cmdline,
-            memory_hotplug,
-            event_manager,
-            virtio_mem_addr.expect("address should be allocated"),
-        )?;
+        if let Some(unix_vsock) = vm_resources.vsock.get()
+            && wanted(VirtioDeviceType::Vsock, VSOCK_DEV_ID)
+        {
+            attach_unixsock_vsock_device(
+                &mut device_manager,
+                &vm,
+                &mut boot_cmdline,
+                unix_vsock,
+                event_manager,
+                placement,
+            )?;
+        }
+
+        if let Some(entropy) = vm_resources.entropy.get()
+            && wanted(VirtioDeviceType::Rng, ENTROPY_DEV_ID)
+        {
+            attach_entropy_device(
+                &mut device_manager,
+                &vm,
+                &mut boot_cmdline,
+                entropy,
+                event_manager,
+                placement,
+            )?;
+        }
+
+        if let Some(memory_hotplug) = &vm_resources.memory_hotplug
+            && wanted(VirtioDeviceType::Mem, VIRTIO_MEM_DEV_ID)
+        {
+            attach_virtio_mem_device(
+                &mut device_manager,
+                &vm,
+                &mut boot_cmdline,
+                memory_hotplug,
+                event_manager,
+                virtio_mem_addr.expect("address should be allocated"),
+                placement,
+            )?;
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -298,8 +349,6 @@ pub fn build_microvm_for_boot(
         vm_resources.serial_out_path.as_ref(),
         vm_resources.serial_rate_limiter(),
     )?;
-
-    device_manager.attach_root_ports(&kvm_vm)?;
 
     device_manager.attach_vmgenid_device(&kvm_vm)?;
     device_manager.attach_vmclock_device(&kvm_vm)?;
@@ -591,6 +640,7 @@ fn attach_entropy_device(
     cmdline: &mut LoaderKernelCmdline,
     entropy_device: &Arc<Mutex<Entropy>>,
     event_manager: &mut EventManager,
+    placement: PciPlacement,
 ) -> Result<(), AttachDeviceError> {
     let id = entropy_device
         .lock()
@@ -605,6 +655,7 @@ fn attach_entropy_device(
         cmdline,
         event_manager,
         false,
+        placement,
     )
 }
 
@@ -631,6 +682,7 @@ fn attach_virtio_mem_device(
     config: &MemoryHotplugConfig,
     event_manager: &mut EventManager,
     addr: GuestAddress,
+    placement: PciPlacement,
 ) -> Result<(), StartMicrovmError> {
     let kvm_vm = vm
         .as_kvm()
@@ -655,6 +707,7 @@ fn attach_virtio_mem_device(
         cmdline,
         event_manager,
         false,
+        placement,
     )?;
     Ok(())
 }
@@ -665,6 +718,7 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
     cmdline: &mut LoaderKernelCmdline,
     blocks: I,
     event_manager: &mut EventManager,
+    placement: PciPlacement,
 ) -> Result<(), StartMicrovmError> {
     for block in blocks {
         let (id, is_vhost_user) = {
@@ -686,6 +740,7 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
             cmdline,
             event_manager,
             is_vhost_user,
+            placement,
         )?;
     }
     Ok(())
@@ -697,6 +752,7 @@ fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Net>>> + Debug>(
     cmdline: &mut LoaderKernelCmdline,
     net_devices: I,
     event_manager: &mut EventManager,
+    placement: PciPlacement,
 ) -> Result<(), StartMicrovmError> {
     for net_device in net_devices {
         let id = net_device.lock().expect("Poisoned lock").id().to_string();
@@ -708,6 +764,7 @@ fn attach_net_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Net>>> + Debug>(
             cmdline,
             event_manager,
             false,
+            placement,
         )?;
     }
     Ok(())
@@ -719,6 +776,7 @@ fn attach_pmem_devices(
     cmdline: &mut LoaderKernelCmdline,
     configs: &[PmemConfig],
     event_manager: &mut EventManager,
+    placement: PciPlacement,
 ) -> Result<(), StartMicrovmError> {
     let kvm_vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
     for (i, config) in configs.iter().enumerate() {
@@ -733,7 +791,15 @@ fn attach_pmem_devices(
         let pmem = Pmem::new(kvm_vm.clone(), config.clone())?;
         let device = Arc::new(Mutex::new(pmem));
 
-        device_manager.attach_boot_virtio_device(vm, id, device, cmdline, event_manager, false)?;
+        device_manager.attach_boot_virtio_device(
+            vm,
+            id,
+            device,
+            cmdline,
+            event_manager,
+            false,
+            placement,
+        )?;
     }
     Ok(())
 }
@@ -744,6 +810,7 @@ fn attach_unixsock_vsock_device(
     cmdline: &mut LoaderKernelCmdline,
     unix_vsock: &Arc<Mutex<Vsock<VsockUnixBackend>>>,
     event_manager: &mut EventManager,
+    placement: PciPlacement,
 ) -> Result<(), AttachDeviceError> {
     let id = String::from(unix_vsock.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
@@ -754,6 +821,7 @@ fn attach_unixsock_vsock_device(
         cmdline,
         event_manager,
         false,
+        placement,
     )
 }
 
@@ -763,11 +831,20 @@ fn attach_balloon_device(
     cmdline: &mut LoaderKernelCmdline,
     balloon: &Arc<Mutex<Balloon>>,
     event_manager: &mut EventManager,
+    placement: PciPlacement,
 ) -> Result<(), AttachDeviceError> {
     let _kvm_vm = vm.as_kvm().ok_or(AttachDeviceError::NotSupported)?;
     let id = String::from(balloon.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
-    device_manager.attach_boot_virtio_device(vm, id, balloon.clone(), cmdline, event_manager, false)
+    device_manager.attach_boot_virtio_device(
+        vm,
+        id,
+        balloon.clone(),
+        cmdline,
+        event_manager,
+        false,
+        placement,
+    )
 }
 
 #[cfg(test)]
@@ -941,6 +1018,7 @@ pub(crate) mod tests {
             cmdline,
             block_dev_configs.devices.iter(),
             event_manager,
+            PciPlacement::RootBus,
         )
         .unwrap();
         block_files
@@ -961,6 +1039,7 @@ pub(crate) mod tests {
             cmdline,
             net_builder.iter(),
             event_manager,
+            PciPlacement::RootBus,
         );
         res.unwrap();
     }
@@ -988,6 +1067,7 @@ pub(crate) mod tests {
             cmdline,
             net_builder.iter(),
             event_manager,
+            PciPlacement::RootBus,
         )
         .unwrap();
     }
@@ -1008,6 +1088,7 @@ pub(crate) mod tests {
             cmdline,
             &vsock,
             event_manager,
+            PciPlacement::RootBus,
         )
         .unwrap();
 
@@ -1033,6 +1114,7 @@ pub(crate) mod tests {
             cmdline,
             &entropy,
             event_manager,
+            PciPlacement::RootBus,
         )
         .unwrap();
 
@@ -1066,6 +1148,7 @@ pub(crate) mod tests {
             cmdline,
             &builder.configs,
             event_manager,
+            PciPlacement::RootBus,
         )
         .unwrap();
         files
@@ -1101,6 +1184,7 @@ pub(crate) mod tests {
             cmdline,
             balloon,
             event_manager,
+            PciPlacement::RootBus,
         )
         .unwrap();
 
@@ -1439,6 +1523,7 @@ pub(crate) mod tests {
             &config,
             event_manager,
             GuestAddress(512 << 30),
+            PciPlacement::RootBus,
         )
         .unwrap();
     }
