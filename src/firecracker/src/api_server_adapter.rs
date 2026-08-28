@@ -75,6 +75,10 @@ impl ApiServerAdapter {
                 .expect("Poisoned lock")
                 .handle_request(event_manager);
 
+            vmm.lock()
+                .expect("Poisoned lock")
+                .complete_hotplug_removals(event_manager);
+
             match vmm.lock().unwrap().shutdown_exit_code() {
                 Some(FcExitCode::Ok) => break,
                 Some(exit_code) => return Err(ApiServerError::MicroVMStoppedWithError(exit_code)),

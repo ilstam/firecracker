@@ -746,6 +746,7 @@ impl Vmm {
         &mut self,
         device_id: VirtioDeviceId,
         event_manager: &mut EventManager,
+        force: bool,
     ) -> Result<(), VmmActionError> {
         log_dev_preview_warning("PCI device hot-unplug", None);
         let kvm_vm = self
@@ -754,7 +755,17 @@ impl Vmm {
             .ok_or_else(|| VmmActionError::NotSupported("Operation requires KVM".to_string()))?
             .clone();
         self.device_manager
-            .hot_unplug_device(kvm_vm, device_id, event_manager)
+            .hot_unplug_device(kvm_vm, device_id, event_manager, force)
+    }
+
+    /// Tear down any devices whose guests have acknowledged a managed
+    /// hot-unplug. Called from the control loop, which owns the event manager,
+    /// after the Root Port completion eventfd has woken it.
+    pub fn complete_hotplug_removals(&mut self, event_manager: &mut EventManager) {
+        if let Some(kvm_vm) = self.vm.as_kvm().cloned() {
+            self.device_manager
+                .complete_hotplug_removals(&kvm_vm, event_manager);
+        }
     }
 }
 
@@ -813,6 +824,18 @@ impl MutEventSubscriber for Vmm {
         let source = event.fd();
         let event_set = event.event_set();
 
+        // A guest acknowledged a managed hot-unplug. Only drain the eventfd
+        // here so it stops firing; the teardown needs the event manager, which
+        // the control loop owns, so it happens there via
+        // complete_hotplug_removals().
+        if let Some(evt) = self.device_manager.hotplug_completion_evt()
+            && source == evt.as_raw_fd()
+            && event_set == EventSet::IN
+        {
+            let _ = evt.read();
+            return;
+        }
+
         match &self.vm {
             Vm::Kvm(kvm_vm) => {
                 if source == kvm_vm.vcpus_exit_evt().as_raw_fd() && event_set == EventSet::IN {
@@ -855,6 +878,11 @@ impl MutEventSubscriber for Vmm {
                     error!("Failed to register vmm exit event: {}", err);
                 }
             }
+        }
+        if let Some(evt) = self.device_manager.hotplug_completion_evt()
+            && let Err(err) = ops.add(Events::new(evt, EventSet::IN))
+        {
+            error!("Failed to register hot-unplug completion event: {}", err);
         }
     }
 }

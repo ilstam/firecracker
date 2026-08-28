@@ -5,6 +5,8 @@
 
 use std::sync::{Arc, Barrier, Mutex};
 
+use vmm_sys_util::eventfd::EventFd;
+
 use zerocopy::IntoBytes;
 
 use crate::logger::error;
@@ -38,6 +40,31 @@ const MSIX_TABLE_ENTRY_SIZE: u64 = 16;
 
 const LINK_STATUS_UP: u16 = PCI_EXP_LNKSTA_DLLLA | PCI_EXP_LNKSTA_CLS_2_5GB | PCI_EXP_LNKSTA_NLW_X1;
 
+/// Shared channel by which Root Ports report that a guest has acknowledged a
+/// managed hot-unplug, by turning the slot's Power Indicator off.
+///
+/// The acknowledgement arrives as a config write on a vCPU thread, but tearing
+/// the device down needs the VMM thread, which owns the event manager. So the
+/// port only records its secondary bus here and signals `evt`; the VMM drains
+/// `acked_buses` when `evt` fires.
+#[derive(Debug)]
+pub struct HotplugCompletion {
+    /// Signalled when at least one slot has acknowledged removal.
+    pub evt: EventFd,
+    /// Secondary buses whose endpoints are ready to be torn down.
+    pub acked_buses: Mutex<Vec<u8>>,
+}
+
+impl HotplugCompletion {
+    /// Create a new completion channel.
+    pub fn new() -> std::io::Result<Self> {
+        Ok(HotplugCompletion {
+            evt: EventFd::new(libc::EFD_NONBLOCK)?,
+            acked_buses: Mutex::new(Vec::new()),
+        })
+    }
+}
+
 /// A PCI Express Root Port with a hot-plug capable slot.
 #[derive(Debug)]
 pub struct PciRootPort {
@@ -50,6 +77,10 @@ pub struct PciRootPort {
     slot_status: u16,
     link_status: u16,
     secondary_bus: u8,
+    /// Whether a managed removal is waiting for the guest to power the slot
+    /// off. Guards against acting on an unrelated power-off write.
+    removal_requested: bool,
+    completion: Arc<HotplugCompletion>,
 }
 
 impl PciRootPort {
@@ -60,11 +91,13 @@ impl PciRootPort {
     ///   advertises to the guest as its physical slot number
     /// * `msix_vectors` - a single-vector MSI-X group
     /// * `msix_bar_addr` - guest-physical base address of the MSI-X BAR
+    /// * `completion` - channel for reporting acknowledged managed removals
     pub fn new(
         sbdf: PciSBDF,
         secondary_bus: u8,
         msix_vectors: Arc<MsixVectorGroup>,
         msix_bar_addr: u64,
+        completion: Arc<HotplugCompletion>,
     ) -> Self {
         assert_eq!(msix_vectors.num_vectors(), ROOT_PORT_MSIX_VECTORS);
 
@@ -117,6 +150,8 @@ impl PciRootPort {
             slot_status: 0,
             link_status: 0,
             secondary_bus,
+            removal_requested: false,
+            completion,
         }
     }
 
@@ -197,6 +232,7 @@ impl PciRootPort {
     /// The device remains present until eject() is called (either after the
     /// guest acknowledges the removal or due to a force detach).
     pub fn request_unplug(&mut self) {
+        self.removal_requested = true;
         self.slot_status |= PCI_EXP_SLTSTA_ABP;
         if self.must_inject_irq(PCI_EXP_SLTSTA_ABP) {
             self.inject_irq();
@@ -205,6 +241,7 @@ impl PciRootPort {
 
     /// Signal to the guest that slot is now empty.
     pub fn eject(&mut self) {
+        self.removal_requested = false;
         self.link_status &= !LINK_STATUS_UP;
         self.slot_status &= !PCI_EXP_SLTSTA_PDS;
         self.slot_status |= PCI_EXP_SLTSTA_PDC | PCI_EXP_SLTSTA_DLLSC;
@@ -270,7 +307,19 @@ impl PciDevice for PciRootPort {
             self.configuration
                 .write_config_register(reg_idx, offset, data);
         } else if reg_idx == self.slot_reg_idx() {
-            self.write_slot_dword(offset, data);
+            if self.write_slot_dword(offset, data) && self.removal_requested {
+                // The guest has quiesced the device and powered the slot off,
+                // so the backend can go. Hand the slot to the VMM thread.
+                self.removal_requested = false;
+                self.completion
+                    .acked_buses
+                    .lock()
+                    .expect("Poisoned lock")
+                    .push(self.secondary_bus);
+                if let Err(err) = self.completion.evt.write(1) {
+                    error!("root_port: failed to signal hot-unplug completion: {err}");
+                }
+            }
         } else {
             self.configuration
                 .write_config_register(reg_idx, offset, data);
@@ -351,13 +400,22 @@ mod tests {
     };
     use crate::vstate::vm::KvmVm;
 
-    fn new_root_port() -> PciRootPort {
+    fn new_msix_vectors() -> Arc<MsixVectorGroup> {
         let vmm = default_vmm();
-        let vectors = Arc::new(
+        Arc::new(
             KvmVm::create_msix_group(vmm.vm.as_kvm().unwrap().clone(), ROOT_PORT_MSIX_VECTORS)
                 .unwrap(),
-        );
-        PciRootPort::new(PciSBDF::new(0, 0, 1, 0), 1, vectors, 0x1_0000_0000)
+        )
+    }
+
+    fn new_root_port() -> PciRootPort {
+        PciRootPort::new(
+            PciSBDF::new(0, 0, 1, 0),
+            1,
+            new_msix_vectors(),
+            0x1_0000_0000,
+            Arc::new(HotplugCompletion::new().unwrap()),
+        )
     }
 
     #[test]
@@ -430,6 +488,59 @@ mod tests {
         assert!(rp.write_slot_dword(0, &PCI_EXP_SLTCTL_PWR_IND_OFF.to_le_bytes()));
         // Staying off is not a new transition.
         assert!(!rp.write_slot_dword(0, &PCI_EXP_SLTCTL_PWR_IND_OFF.to_le_bytes()));
+    }
+
+    #[test]
+    fn test_managed_removal_reports_the_guest_ack() {
+        let completion = Arc::new(HotplugCompletion::new().unwrap());
+        let mut rp = PciRootPort::new(
+            PciSBDF::new(0, 0, 1, 0),
+            7,
+            new_msix_vectors(),
+            0x1_0000_0000,
+            completion.clone(),
+        );
+        let reg = rp.slot_reg_idx();
+        rp.plug(true);
+
+        // A power-off with no removal pending is the guest's business, not an
+        // acknowledgement of anything.
+        rp.write_config_register(reg, 0, &PCI_EXP_SLTCTL_PWR_IND_OFF.to_le_bytes());
+        assert!(completion.acked_buses.lock().unwrap().is_empty());
+
+        // Once asked, the same write means the device can go, and names the
+        // secondary bus so the VMM can find it.
+        rp.request_unplug();
+        rp.write_config_register(reg, 0, &0u16.to_le_bytes());
+        rp.write_config_register(reg, 0, &PCI_EXP_SLTCTL_PWR_IND_OFF.to_le_bytes());
+        assert_eq!(*completion.acked_buses.lock().unwrap(), vec![7]);
+        assert_eq!(completion.evt.read().unwrap(), 1);
+
+        // The request is one-shot: a later power-off does not report again.
+        rp.write_config_register(reg, 0, &0u16.to_le_bytes());
+        rp.write_config_register(reg, 0, &PCI_EXP_SLTCTL_PWR_IND_OFF.to_le_bytes());
+        assert_eq!(*completion.acked_buses.lock().unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn test_forced_removal_expects_no_ack() {
+        let completion = Arc::new(HotplugCompletion::new().unwrap());
+        let mut rp = PciRootPort::new(
+            PciSBDF::new(0, 0, 1, 0),
+            7,
+            new_msix_vectors(),
+            0x1_0000_0000,
+            completion.clone(),
+        );
+        let reg = rp.slot_reg_idx();
+        rp.plug(true);
+        rp.request_unplug();
+
+        // The device is already gone, so a late power-off from the guest must
+        // not ask the VMM to tear it down a second time.
+        rp.eject();
+        rp.write_config_register(reg, 0, &PCI_EXP_SLTCTL_PWR_IND_OFF.to_le_bytes());
+        assert!(completion.acked_buses.lock().unwrap().is_empty());
     }
 
     #[test]
