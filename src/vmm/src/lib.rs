@@ -143,7 +143,8 @@ use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemSt
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::rng::Entropy;
-use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
+use crate::devices::virtio::vsock::{VSOCK_DEV_ID, Vsock, VsockUnixBackend};
 use crate::logger::{METRICS, MetricsError, log_dev_preview_warning};
 use crate::mmds::data_store::Mmds;
 use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
@@ -355,16 +356,26 @@ impl Vmm {
         let mut mmds_ipv4_address = None;
         let mut mmds_ref = None;
 
+        // A device does not know where it was put on the PCI topology, so the
+        // configs it hands back leave `removable` cleared and we fill it in from
+        // the topology itself.
+        let device_manager = &self.device_manager;
+        let removable = |device_type, id: &str| device_manager.is_device_removable(device_type, id);
+
         self.device_manager
             .for_each_virtio_device(|device_type, device| match device_type {
                 VirtioDeviceType::Block => {
                     if let Some(b) = device.as_any().downcast_ref::<Block>() {
-                        block.push(b.config());
+                        let mut config = b.config();
+                        config.removable = removable(device_type, &config.drive_id);
+                        block.push(config);
                     }
                 }
                 VirtioDeviceType::Net => {
                     if let Some(n) = device.as_any().downcast_ref::<Net>() {
-                        net.push(NetworkInterfaceConfig::from(n));
+                        let mut config = NetworkInterfaceConfig::from(n);
+                        config.removable = removable(device_type, &config.iface_id);
+                        net.push(config);
                         if let Some(mmds_ns) = &n.mmds_ns {
                             net_with_mmds.push(n.id.clone());
                             if mmds_ref.is_none() {
@@ -376,27 +387,37 @@ impl Vmm {
                 }
                 VirtioDeviceType::Pmem => {
                     if let Some(p) = device.as_any().downcast_ref::<Pmem>() {
-                        pmem.push(p.config.clone());
+                        let mut config = p.config.clone();
+                        config.removable = removable(device_type, &config.id);
+                        pmem.push(config);
                     }
                 }
                 VirtioDeviceType::Balloon => {
                     if let Some(b) = device.as_any().downcast_ref::<Balloon>() {
-                        balloon = Some(BalloonDeviceConfig::from(b.config()));
+                        let mut config = BalloonDeviceConfig::from(b.config());
+                        config.removable = removable(device_type, BALLOON_DEV_ID);
+                        balloon = Some(config);
                     }
                 }
                 VirtioDeviceType::Vsock => {
                     if let Some(v) = device.as_any().downcast_ref::<Vsock<VsockUnixBackend>>() {
-                        vsock = Some(VsockDeviceConfig::from(v));
+                        let mut config = VsockDeviceConfig::from(v);
+                        config.removable = removable(device_type, VSOCK_DEV_ID);
+                        vsock = Some(config);
                     }
                 }
                 VirtioDeviceType::Rng => {
                     if let Some(e) = device.as_any().downcast_ref::<Entropy>() {
-                        entropy = Some(EntropyDeviceConfig::from(e));
+                        let mut config = EntropyDeviceConfig::from(e);
+                        config.removable = removable(device_type, ENTROPY_DEV_ID);
+                        entropy = Some(config);
                     }
                 }
                 VirtioDeviceType::Mem => {
                     if let Some(m) = device.as_any().downcast_ref::<VirtioMem>() {
-                        memory_hotplug = Some(MemoryHotplugConfig::from(m));
+                        let mut config = MemoryHotplugConfig::from(m);
+                        config.removable = removable(device_type, VIRTIO_MEM_DEV_ID);
+                        memory_hotplug = Some(config);
                     }
                 }
             });

@@ -927,6 +927,7 @@ pub(crate) mod tests {
                 topology: None,
 
                 socket: None,
+                removable: false,
             };
 
             block_dev_configs
@@ -1122,6 +1123,7 @@ pub(crate) mod tests {
             mtu: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
+            removable: false,
         };
 
         let mut cmdline = default_kernel_cmdline();
@@ -1375,6 +1377,7 @@ pub(crate) mod tests {
             stats_polling_interval_s: 0,
             free_page_hinting: false,
             free_page_reporting: false,
+            removable: false,
         };
 
         let mut cmdline = default_kernel_cmdline();
@@ -1449,6 +1452,7 @@ pub(crate) mod tests {
             total_size_mib: 1024,
             block_size_mib: 2,
             slot_size_mib: 128,
+            removable: false,
         };
 
         let mut cmdline = default_kernel_cmdline();

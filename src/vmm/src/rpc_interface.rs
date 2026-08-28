@@ -1301,6 +1301,7 @@ mod tests {
                 vsock_id: Some(String::new()),
                 guest_cid: 0,
                 uds_path: String::new(),
+                removable: false,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetBalloonDevice(
@@ -1311,6 +1312,7 @@ mod tests {
                 vsock_id: Some(String::new()),
                 guest_cid: 0,
                 uds_path: String::new(),
+                removable: false,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetMmdsConfiguration(

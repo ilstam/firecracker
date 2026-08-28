@@ -17,6 +17,11 @@ use crate::rate_limiter::RateLimiter;
 pub struct EntropyDeviceConfig {
     /// Configuration for RateLimiter of Entropy device
     pub rate_limiter: Option<RateLimiterConfig>,
+    /// If set to true, the device is placed behind a PCIe Root Port, which is
+    /// what makes it possible to hot-unplug it later. It consumes one of the
+    /// ports set aside by `pcie_hotplug_ports`.
+    #[serde(default)]
+    pub removable: bool,
 }
 
 impl From<&Entropy> for EntropyDeviceConfig {
@@ -24,6 +29,7 @@ impl From<&Entropy> for EntropyDeviceConfig {
         let rate_limiter: RateLimiterConfig = dev.rate_limiter().into();
         EntropyDeviceConfig {
             rate_limiter: rate_limiter.into_option(),
+            removable: false,
         }
     }
 }

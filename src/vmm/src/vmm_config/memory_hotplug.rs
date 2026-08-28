@@ -44,6 +44,11 @@ pub struct MemoryHotplugConfig {
     /// Slot size in MiB. A slot is the smallest unit the host can (de)attach memory
     #[serde(default = "default_slot_size_mib")]
     pub slot_size_mib: u32,
+    /// If set to true, the device is placed behind a PCIe Root Port, which is
+    /// what makes it possible to hot-unplug it later. It consumes one of the
+    /// ports set aside by `pcie_hotplug_ports`.
+    #[serde(default)]
+    pub removable: bool,
 }
 
 impl MemoryHotplugConfig {
@@ -92,6 +97,7 @@ impl From<&VirtioMem> for MemoryHotplugConfig {
             total_size_mib: mem.total_size_mib(),
             block_size_mib: mem.block_size_mib(),
             slot_size_mib: mem.slot_size_mib(),
+            removable: false,
         }
     }
 }
@@ -116,6 +122,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 2,
             slot_size_mib: 128,
+            removable: false,
         };
         config.validate().unwrap();
     }
@@ -126,6 +133,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 1,
             slot_size_mib: 128,
+            removable: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::BlockSizeTooSmall(min)) => assert_eq!(min, 2),
@@ -139,6 +147,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 3,
             slot_size_mib: 128,
+            removable: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::BlockSizeNotPowerOfTwo) => {}
@@ -152,6 +161,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 2,
             slot_size_mib: 1,
+            removable: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::SlotSizeTooSmall(min)) => assert_eq!(min, 128),
@@ -165,6 +175,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 4,
             slot_size_mib: 130,
+            removable: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::SlotSizeNotMultipleOfBlockSize(block_size)) => {
@@ -180,6 +191,7 @@ mod tests {
             total_size_mib: 64,
             block_size_mib: 2,
             slot_size_mib: 128,
+            removable: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::TotalSizeTooSmall(slot_size)) => {
@@ -195,6 +207,7 @@ mod tests {
             total_size_mib: 1000,
             block_size_mib: 2,
             slot_size_mib: 128,
+            removable: false,
         };
         match config.validate() {
             Err(MemoryHotplugConfigError::TotalSizeNotMultipleOfSlotSize(slot_size)) => {
@@ -219,6 +232,7 @@ mod tests {
                 total_size_mib: 1024,
                 block_size_mib: 2,
                 slot_size_mib: 128,
+                removable: false,
             }
         );
     }
@@ -229,6 +243,7 @@ mod tests {
             total_size_mib: 1024,
             block_size_mib: 4,
             slot_size_mib: 256,
+            removable: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: MemoryHotplugConfig = serde_json::from_str(&json).unwrap();

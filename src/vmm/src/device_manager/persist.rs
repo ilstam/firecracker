@@ -621,6 +621,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                 total_size_mib: device.total_size_mib(),
                 block_size_mib: device.block_size_mib(),
                 slot_size_mib: device.slot_size_mib(),
+                removable: false,
             });
 
             let arcd_device = Arc::new(Mutex::new(device));
@@ -719,6 +720,7 @@ mod tests {
                 stats_polling_interval_s: 1,
                 free_page_hinting: false,
                 free_page_reporting: false,
+                removable: false,
             };
             insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_cfg);
             // Add a block device.
@@ -740,6 +742,7 @@ mod tests {
                 mtu: None,
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
+                removable: false,
             };
             insert_net_device_with_mmds(
                 &mut vmm,
@@ -754,6 +757,7 @@ mod tests {
                 vsock_id: Some(vsock_dev_id.to_string()),
                 guest_cid: 3,
                 uds_path: tmp_sock_file.as_path().to_str().unwrap().to_string(),
+                removable: false,
             };
             insert_vsock_device(&mut vmm, &mut cmdline, &mut event_manager, vsock_config);
             // Add an entropy device.
@@ -775,6 +779,7 @@ mod tests {
                 total_size_mib: 1024,
                 block_size_mib: 2,
                 slot_size_mib: 128,
+                removable: false,
             };
             insert_virtio_mem_device(
                 &mut vmm,
@@ -816,7 +821,8 @@ mod tests {
     "deflate_on_oom": false,
     "stats_polling_interval_s": 1,
     "free_page_hinting": false,
-    "free_page_reporting": false
+    "free_page_reporting": false,
+    "removable": false
   }},
   "drives": [
     {{
@@ -836,7 +842,8 @@ mod tests {
         "min_io_size": 0,
         "opt_io_size": 128
       }},
-      "socket": null
+      "socket": null,
+      "removable": false
     }}
   ],
   "boot-source": {{
@@ -870,15 +877,18 @@ mod tests {
       "guest_mac": null,
       "mtu": null,
       "rx_rate_limiter": null,
-      "tx_rate_limiter": null
+      "tx_rate_limiter": null,
+      "removable": false
     }}
   ],
   "vsock": {{
     "guest_cid": 3,
-    "uds_path": "{}"
+    "uds_path": "{}",
+    "removable": false
   }},
   "entropy": {{
-    "rate_limiter": null
+    "rate_limiter": null,
+    "removable": false
   }},
   "pmem": [
     {{
@@ -886,13 +896,15 @@ mod tests {
       "path_on_host": "{}",
       "root_device": true,
       "read_only": true,
-      "rate_limiter": null
+      "rate_limiter": null,
+      "removable": false
     }}
   ],
   "memory-hotplug": {{
     "total_size_mib": 1024,
     "block_size_mib": 2,
-    "slot_size_mib": 128
+    "slot_size_mib": 128,
+    "removable": false
   }}
 }}"#,
             _block_files.last().unwrap().as_path().to_str().unwrap(),

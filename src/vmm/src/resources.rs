@@ -1,6 +1,7 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::convert::From;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -9,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use vm_memory::GuestAddress;
 
 use crate::cpu_config::templates::CustomCpuTemplate;
-use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
+use crate::devices::virtio::mem::VIRTIO_MEM_DEV_ID;
+use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
+use crate::devices::virtio::vsock::VSOCK_DEV_ID;
 use crate::logger::{LoggerConfig, info};
 use crate::mmds;
 use crate::mmds::data_store::{Mmds, MmdsVersion};
@@ -138,6 +142,12 @@ pub struct VmResources {
     pub serial_out_path: Option<PathBuf>,
     /// Optional rate limiter config for serial output.
     pub serial_rate_limiter_cfg: Option<TokenBucketConfig>,
+    /// The devices the user asked to be `removable`.
+    ///
+    /// Kept here rather than on each device because a device is not told where
+    /// it will end up on the PCI topology, and the builders reconstruct their
+    /// configs from the devices they hold, which would lose the flag.
+    pub removable_devices: HashSet<VirtioDeviceId>,
 }
 
 impl VmResources {
@@ -334,6 +344,24 @@ impl VmResources {
         mmds_config
     }
 
+    /// Record whether a device was asked to be `removable`. Re-configuring a
+    /// device replaces the previous answer, so clearing the flag works too.
+    fn set_removable(&mut self, device_type: VirtioDeviceType, id: &str, removable: bool) {
+        let key = (device_type, id.to_string());
+        if removable {
+            self.removable_devices.insert(key);
+        } else {
+            self.removable_devices.remove(&key);
+        }
+    }
+
+    /// Whether the device was asked to be `removable`, and so should be placed
+    /// behind a PCIe Root Port.
+    pub fn is_removable(&self, device_type: VirtioDeviceType, id: &str) -> bool {
+        self.removable_devices
+            .contains(&(device_type, id.to_string()))
+    }
+
     /// Sets a balloon device to be attached when the VM starts.
     pub fn set_balloon_device(
         &mut self,
@@ -345,6 +373,7 @@ impl VmResources {
             return Err(BalloonConfigError::TooManyPagesRequested);
         }
 
+        self.set_removable(VirtioDeviceType::Balloon, BALLOON_DEV_ID, config.removable);
         self.balloon.set(config)
     }
 
@@ -369,6 +398,11 @@ impl VmResources {
         block_device_config: BlockDeviceConfig,
     ) -> Result<(), DriveError> {
         let has_pmem_root = self.pmem.has_root_device();
+        self.set_removable(
+            VirtioDeviceType::Block,
+            &block_device_config.drive_id,
+            block_device_config.removable,
+        );
         self.block.insert(block_device_config, has_pmem_root)
     }
 
@@ -377,12 +411,14 @@ impl VmResources {
         &mut self,
         body: NetworkInterfaceConfig,
     ) -> Result<(), NetworkInterfaceError> {
+        self.set_removable(VirtioDeviceType::Net, &body.iface_id, body.removable);
         let _ = self.net_builder.build(body)?;
         Ok(())
     }
 
     /// Sets a vsock device to be attached when the VM starts.
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<(), VsockConfigError> {
+        self.set_removable(VirtioDeviceType::Vsock, VSOCK_DEV_ID, config.removable);
         self.vsock.insert(config)
     }
 
@@ -391,12 +427,14 @@ impl VmResources {
         &mut self,
         body: EntropyDeviceConfig,
     ) -> Result<(), EntropyDeviceError> {
+        self.set_removable(VirtioDeviceType::Rng, ENTROPY_DEV_ID, body.removable);
         self.entropy.insert(body)
     }
 
     /// Builds a pmem device to be attached when the VM starts.
     pub fn build_pmem_device(&mut self, body: PmemConfig) -> Result<(), PmemConfigError> {
         let has_block_root = self.block.has_root_device();
+        self.set_removable(VirtioDeviceType::Pmem, &body.id, body.removable);
         self.pmem.build(body, has_block_root)
     }
 
@@ -406,6 +444,7 @@ impl VmResources {
         config: MemoryHotplugConfig,
     ) -> Result<(), MemoryHotplugConfigError> {
         config.validate()?;
+        self.set_removable(VirtioDeviceType::Mem, VIRTIO_MEM_DEV_ID, config.removable);
         self.memory_hotplug = Some(config);
         Ok(())
     }
@@ -543,18 +582,55 @@ impl VmResources {
 
 impl From<&VmResources> for VmmConfig {
     fn from(resources: &VmResources) -> Self {
+        // The builders rebuild their configs from the devices they hold, which
+        // do not carry the flag, so put it back from the record kept here.
+        let restore_removable = |device_type, id: &str, config_removable: &mut bool| {
+            *config_removable = resources.is_removable(device_type, id);
+        };
+
+        let mut balloon = resources.balloon.get_config().ok();
+        if let Some(config) = &mut balloon {
+            restore_removable(
+                VirtioDeviceType::Balloon,
+                BALLOON_DEV_ID,
+                &mut config.removable,
+            );
+        }
+
+        let mut drives = resources.block.configs();
+        for config in &mut drives {
+            let removable = resources.is_removable(VirtioDeviceType::Block, &config.drive_id);
+            config.removable = removable;
+        }
+
+        let mut network_interfaces = resources.net_builder.configs();
+        for config in &mut network_interfaces {
+            let removable = resources.is_removable(VirtioDeviceType::Net, &config.iface_id);
+            config.removable = removable;
+        }
+
+        let mut vsock = resources.vsock.config();
+        if let Some(config) = &mut vsock {
+            restore_removable(VirtioDeviceType::Vsock, VSOCK_DEV_ID, &mut config.removable);
+        }
+
+        let mut entropy = resources.entropy.config();
+        if let Some(config) = &mut entropy {
+            restore_removable(VirtioDeviceType::Rng, ENTROPY_DEV_ID, &mut config.removable);
+        }
+
         VmmConfig {
-            balloon: resources.balloon.get_config().ok(),
-            drives: resources.block.configs(),
+            balloon,
+            drives,
             boot_source: resources.boot_source.config.clone(),
             cpu_config: None,
             logger: None,
             machine_config: Some(resources.machine_config.clone()),
             metrics: None,
             mmds_config: resources.mmds_config(),
-            network_interfaces: resources.net_builder.configs(),
-            vsock: resources.vsock.config(),
-            entropy: resources.entropy.config(),
+            network_interfaces,
+            vsock,
+            entropy,
             pmem_devices: resources.pmem.configs.clone(),
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots.
             serial_config: None,
@@ -579,7 +655,7 @@ mod tests {
     use crate::cpu_config::templates::{CpuTemplateType, StaticCpuTemplate};
     use crate::devices::virtio::block::virtio::VirtioBlockError;
     use crate::devices::virtio::block::{BlockError, CacheType};
-    use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::vsock::VSOCK_DEV_ID;
     use crate::resources::VmResources;
     use crate::utils::net::mac::MacAddr;
@@ -608,6 +684,7 @@ mod tests {
             mtu: None,
             rx_rate_limiter: Some(RateLimiterConfig::default()),
             tx_rate_limiter: Some(RateLimiterConfig::default()),
+            removable: false,
         }
     }
 
@@ -636,6 +713,7 @@ mod tests {
                 topology: None,
 
                 socket: None,
+                removable: false,
             },
             tmp_file,
         )
@@ -662,6 +740,7 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
+            removable_devices: HashSet::new(),
             machine_config: MachineConfig::default(),
             boot_source: default_boot_cfg(),
             block: default_blocks(),
@@ -1569,6 +1648,7 @@ mod tests {
                 stats_polling_interval_s: 0,
                 free_page_hinting: false,
                 free_page_reporting: false,
+                removable: false,
             })
             .unwrap();
         aux_vm_config.mem_size_mib = Some(90);
@@ -1597,6 +1677,54 @@ mod tests {
         // trigger the "ballooning incompatible with huge pages" check.
         vm_resources.balloon = BalloonBuilder::new();
         vm_resources.update_machine_config(&aux_vm_config).unwrap();
+    }
+
+    /// `removable` has to survive a config round-trip, so that a caller reading
+    /// back what it configured sees the same thing.
+    #[test]
+    fn test_removable_round_trips_through_the_config() {
+        let kernel_file = TempFile::new().unwrap();
+        let rootfs_file = TempFile::new().unwrap();
+        let scratch_file = TempFile::new().unwrap();
+        let json = format!(
+            r#"{{
+            "boot-source": {{ "kernel_image_path": "{}" }},
+            "drives": [
+                {{ "drive_id": "plain", "is_root_device": true, "is_read_only": false,
+                   "path_on_host": "{}" }},
+                {{ "drive_id": "hotpluggable", "is_root_device": false, "is_read_only": false,
+                   "path_on_host": "{}", "removable": true }}
+            ],
+            "machine-config": {{ "vcpu_count": 1, "mem_size_mib": 128,
+                                 "pcie_hotplug_ports": 1 }}
+        }}"#,
+            kernel_file.as_path().to_str().unwrap(),
+            rootfs_file.as_path().to_str().unwrap(),
+            scratch_file.as_path().to_str().unwrap(),
+        );
+
+        let resources = VmResources::from_json(
+            &json,
+            &InstanceInfo::default(),
+            HTTP_MAX_PAYLOAD_SIZE,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // The record of what was asked for.
+        assert!(!resources.is_removable(VirtioDeviceType::Block, "plain"));
+        assert!(resources.is_removable(VirtioDeviceType::Block, "hotpluggable"));
+
+        // And it is reported back rather than silently dropped.
+        let reported = VmmConfig::from(&resources).drives;
+        let plain = reported.iter().find(|c| c.drive_id == "plain").unwrap();
+        let hotpluggable = reported
+            .iter()
+            .find(|c| c.drive_id == "hotpluggable")
+            .unwrap();
+        assert!(!plain.removable, "absent means not removable");
+        assert!(hotpluggable.removable);
     }
 
     #[test]
@@ -1653,6 +1781,7 @@ mod tests {
             stats_polling_interval_s: 0,
             free_page_hinting: false,
             free_page_reporting: false,
+            removable: false,
         };
         assert!(vm_resources.balloon.get().is_none());
         vm_resources

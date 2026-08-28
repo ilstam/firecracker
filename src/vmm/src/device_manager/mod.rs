@@ -426,6 +426,16 @@ impl DeviceManager {
         }
     }
 
+    /// Return whether the device is behind a PCIe Root Port, and is therefore
+    /// hot-unpluggable.
+    pub fn is_device_removable(&self, device_type: VirtioDeviceType, device_id: &str) -> bool {
+        match &self.virtio_devices {
+            VirtioDevices::Pci(devices) => devices.is_removable(device_type, device_id),
+            // Without PCI there are no Root Ports to be behind.
+            VirtioDevices::Mmio(_) => false,
+        }
+    }
+
     /// Run fn `f()` for the virtio device matching `virtio_type` and `id`.
     pub fn with_virtio_device<T, F, R>(&self, id: &str, f: F) -> Result<R, FindDeviceError>
     where
@@ -943,6 +953,7 @@ pub(crate) mod tests {
             blk_size: None,
             topology: None,
             socket: None,
+            removable: false,
         }
     }
 
@@ -1135,6 +1146,7 @@ pub(crate) mod tests {
             mtu: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
+            removable: false,
         });
         vmm.hotplug_device(cfg, &mut evt_manager).unwrap();
         assert!(
@@ -1151,6 +1163,7 @@ pub(crate) mod tests {
             mtu: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
+            removable: false,
         });
         assert!(matches!(
             vmm.hotplug_device(cfg2, &mut evt_manager),

@@ -32,6 +32,11 @@ pub struct VsockDeviceConfig {
     pub guest_cid: u32,
     /// Path to local unix socket.
     pub uds_path: String,
+    /// If set to true, the device is placed behind a PCIe Root Port, which is
+    /// what makes it possible to hot-unplug it later. It consumes one of the
+    /// ports set aside by `pcie_hotplug_ports`.
+    #[serde(default)]
+    pub removable: bool,
 }
 
 #[derive(Debug)]
@@ -47,6 +52,7 @@ impl From<&VsockAndUnixPath> for VsockDeviceConfig {
             vsock_id: None,
             guest_cid: u32::try_from(vsock_lock.cid()).unwrap(),
             uds_path: vsock.uds_path.clone(),
+            removable: false,
         }
     }
 }
@@ -57,6 +63,7 @@ impl From<&Vsock<VsockUnixBackend>> for VsockDeviceConfig {
             vsock_id: None, // deprecated
             guest_cid: u32::try_from(vsock.cid()).unwrap(),
             uds_path: vsock.backend().host_sock_path().to_owned(),
+            removable: false,
         }
     }
 }
@@ -133,6 +140,7 @@ pub(crate) mod tests {
             vsock_id: None,
             guest_cid: 3,
             uds_path: tmp_sock_file.as_path().to_str().unwrap().to_string(),
+            removable: false,
         }
     }
 

@@ -40,6 +40,11 @@ pub struct BalloonDeviceConfig {
     /// Free page reporting enabled
     #[serde(default)]
     pub free_page_reporting: bool,
+    /// If set to true, the device is placed behind a PCIe Root Port, which is
+    /// what makes it possible to hot-unplug it later. It consumes one of the
+    /// ports set aside by `pcie_hotplug_ports`.
+    #[serde(default)]
+    pub removable: bool,
 }
 
 impl From<BalloonConfig> for BalloonDeviceConfig {
@@ -50,6 +55,7 @@ impl From<BalloonConfig> for BalloonDeviceConfig {
             stats_polling_interval_s: state.stats_polling_interval_s,
             free_page_hinting: state.free_page_hinting,
             free_page_reporting: state.free_page_reporting,
+            removable: false,
         }
     }
 }
@@ -140,6 +146,7 @@ pub(crate) mod tests {
             stats_polling_interval_s: 0,
             free_page_hinting: false,
             free_page_reporting: false,
+            removable: false,
         }
     }
 
@@ -152,6 +159,7 @@ pub(crate) mod tests {
             stats_polling_interval_s: 0,
             free_page_hinting: false,
             free_page_reporting: false,
+            removable: false,
         };
         assert_eq!(default_balloon_config, balloon_config);
         let mut builder = BalloonBuilder::new();
@@ -175,6 +183,7 @@ pub(crate) mod tests {
             stats_polling_interval_s: 3,
             free_page_hinting: false,
             free_page_reporting: false,
+            removable: false,
         };
 
         let actual_balloon_config = BalloonDeviceConfig::from(BalloonConfig {
