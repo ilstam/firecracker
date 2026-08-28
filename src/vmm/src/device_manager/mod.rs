@@ -588,6 +588,14 @@ impl DeviceManager {
                     return Err(VmmActionError::CannotUnplugRootDevice);
                 }
 
+                // Only a device behind a Root Port can be removed: the port is
+                // what gives the guest a way to be told the device is going.
+                // Devices on the root bus are soldered on, as far as the guest
+                // is concerned.
+                if !pci_devices.is_removable(device_id.0, &device_id.1) {
+                    return Err(VmmActionError::DeviceNotRemovable(device_id.1));
+                }
+
                 pci_devices
                     .detach_pci_virtio_device(&vm, device_id, event_manager)
                     .map_err(VmmActionError::PciManager)
@@ -1225,6 +1233,36 @@ pub(crate) mod tests {
             vmm.hot_unplug_device(device_id, &mut evt_manager),
             Err(VmmActionError::CannotUnplugRootDevice)
         ));
+    }
+
+    #[test]
+    fn test_unplug_device_on_root_bus() {
+        let mut evt_manager = EventManager::new().unwrap();
+        let mut vmm = default_vmm_with_pci();
+        let f = TempFile::new().unwrap();
+
+        // A non-root device on the root bus: present, but with no Root Port to
+        // tell the guest it is going away.
+        let cfg = make_hotplug_block_cfg("block0", &f, false);
+        let block = Block::new(cfg).unwrap();
+        pci_devices_mut(&mut vmm.device_manager)
+            .attach_pci_virtio_device(
+                vmm.vm.as_kvm().unwrap(),
+                "block0".to_string(),
+                Arc::new(Mutex::new(block)),
+                &mut evt_manager,
+                PciPlacement::RootBus,
+            )
+            .unwrap();
+
+        let device_id = (VirtioDeviceType::Block, "block0".to_string());
+        let err = vmm
+            .hot_unplug_device(device_id, &mut evt_manager)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Device 'block0' is not removable because it's not plugged to a PCIe root port."
+        );
     }
 
     #[test]
