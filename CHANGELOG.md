@@ -10,7 +10,42 @@ and this project adheres to
 
 ### Added
 
+- [#6150](https://github.com/firecracker-microvm/firecracker/pull/6150): PCI
+  device hot-plug and hot-unplug (developer preview) now notify the guest
+  natively, over PCI Express hot-plug. A hot-plugged device is discovered and a
+  hot-unplugged one released by the guest's `pciehp` driver on its own, so the
+  manual `echo 1 > /sys/bus/pci/rescan` after a plug and
+  `echo 1 > /sys/bus/pci/devices/.../remove` before an unplug are no longer
+  needed. This requires a guest kernel built with `CONFIG_HOTPLUG_PCI=y` and
+  `CONFIG_HOTPLUG_PCI_PCIE=y`.
+- [#6150](https://github.com/firecracker-microvm/firecracker/pull/6150): Added
+  the `pcie_hotplug_ports` machine configuration option, the number of PCI
+  Express Root Ports to reserve for hot-plug, and so the maximum number of
+  devices that can be hot-plugged at once. It defaults to 0 and cannot be
+  changed after boot.
+- [#6150](https://github.com/firecracker-microvm/firecracker/pull/6150): Added a
+  `removable` option to PCI virtio devices, which places a device configured
+  before boot behind a Root Port so that it can be hot-unplugged later.
+- [#6150](https://github.com/firecracker-microvm/firecracker/pull/6150): Added
+  an optional `force` field to the body of a device `DELETE` request, which
+  removes the device immediately instead of waiting for the guest to release it.
+  It can lose in-flight I/O, and is meant as an escape hatch for a guest that
+  does not respond.
+
 ### Changed
+
+- [#6150](https://github.com/firecracker-microvm/firecracker/pull/6150):
+  **Breaking (developer preview)**: hot-plugging a PCI virtio device now
+  requires `pcie_hotplug_ports` to be set in the machine configuration. It
+  defaults to 0, so hot-plug is off unless asked for. A request with no free
+  port is rejected with `No PCIe Root Port is free`.
+- [#6150](https://github.com/firecracker-microvm/firecracker/pull/6150): A
+  device `DELETE` now performs a managed removal and returns before the device
+  is gone: the guest is asked to release it and the backing resources are freed
+  once it has. Poll `GET /vm/config` to observe the removal completing. Linux
+  waits five seconds after the request before acting on it. Only a device behind
+  a Root Port can be removed, that is a hot-plugged one or one marked
+  `removable`; removing anything else is rejected.
 
 ### Deprecated
 
