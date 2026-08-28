@@ -499,3 +499,131 @@ def test_hotplug_max_devices(uvm_any):
 
     refilled = wait_for_pci_devices(vm, len(before) + HOTPLUG_PORTS)
     assert len(refilled - before) == HOTPLUG_PORTS
+
+
+@pin_guest_kernel(ACPI_GUEST_KERNELS)
+@pin_pci(True)
+@pin_hotplug_ports(2)
+def test_hotplug_force_unplug(uvm_any):
+    """
+    A forced unplug removes the device without waiting for the guest.
+    """
+    vm = uvm_any
+
+    _, lspci_before, _ = vm.ssh.check_output("lspci -n")
+    before = set(lspci_before.splitlines())
+
+    host_file = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "block0"), size=4)
+    vm.api.drive.put(
+        drive_id="block0",
+        path_on_host=vm.create_jailed_resource(host_file.path),
+        is_root_device=False,
+        is_read_only=False,
+    )
+    wait_for_pci_devices(vm, len(before) + 1)
+
+    # An unknown field must be rejected rather than quietly ignored, since
+    # mistaking it for a force would be a data-loss hazard.
+    with pytest.raises(RuntimeError, match="unknown field `forced`"):
+        vm.api.drive.delete("block0", forced=True)
+
+    vm.api.drive.delete("block0", force=True)
+    assert wait_for_pci_devices(vm, len(before)) == before
+
+    # And the port it was in is free again.
+    vm.api.drive.put(
+        drive_id="block1",
+        path_on_host=vm.create_jailed_resource(host_file.path),
+        is_root_device=False,
+        is_read_only=False,
+    )
+    wait_for_pci_devices(vm, len(before) + 1)
+
+
+@pin_guest_kernel(ACPI_GUEST_KERNELS)
+@pin_pci(True)
+def test_hotplug_without_ports(uvm_any):
+    """
+    With no Root Ports reserved, hot-plug is rejected and says what to do.
+    """
+    vm = uvm_any
+
+    host_file = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "block0"), size=4)
+    with pytest.raises(RuntimeError, match="No PCIe Root Port is free"):
+        vm.api.drive.put(
+            drive_id="block0",
+            path_on_host=vm.create_jailed_resource(host_file.path),
+            is_root_device=False,
+            is_read_only=False,
+        )
+
+
+@pin_guest_kernel(ACPI_GUEST_KERNELS)
+def test_hotplug_ports_config(microvm_factory, guest_kernel, rootfs):
+    """
+    pcie_hotplug_ports is validated, and needs PCI.
+    """
+    vm = microvm_factory.build(guest_kernel, rootfs, pci=False)
+    vm.spawn()
+    with pytest.raises(RuntimeError, match="PCIe hot-plug ports require PCI"):
+        vm.basic_config(pcie_hotplug_ports=1)
+    vm.kill()
+
+    vm = microvm_factory.build(guest_kernel, rootfs, pci=True)
+    vm.spawn()
+    with pytest.raises(RuntimeError, match="must be at most 31"):
+        vm.basic_config(pcie_hotplug_ports=32)
+
+    # The maximum is accepted, and reported back.
+    vm.basic_config(pcie_hotplug_ports=31)
+    assert vm.api.machine_config.get().json()["pcie_hotplug_ports"] == 31
+
+
+@pin_guest_kernel(ACPI_GUEST_KERNELS)
+def test_removable_boot_device(microvm_factory, guest_kernel, rootfs):
+    """
+    A boot device marked removable is present from boot, sits behind a Root
+    Port, and can be unplugged. A plain one cannot.
+    """
+    vm = microvm_factory.build(guest_kernel, rootfs, pci=True)
+    vm.spawn()
+    vm.basic_config(pcie_hotplug_ports=2)
+    vm.add_net_iface()
+
+    plain = drive_tools.FilesystemFile(os.path.join(vm.fsfiles, "plain"), size=4)
+    vm.add_drive("plain", plain.path)
+    removable = drive_tools.FilesystemFile(
+        os.path.join(vm.fsfiles, "removable"), size=4
+    )
+    vm.add_drive("removable", removable.path, removable=True)
+    vm.start()
+
+    # The flag is reported back.
+    drives = {d["drive_id"]: d for d in vm.api.vm_config.get().json()["drives"]}
+    assert drives["removable"]["removable"] is True
+    assert drives["plain"]["removable"] is False
+
+    # The removable one is on a secondary bus, behind a port; the plain one and
+    # the rootfs are on the root bus.
+    _, lspci, _ = vm.ssh.check_output("lspci -n")
+    buses = {line.split(":")[0] for line in lspci.splitlines()}
+    assert "01" in buses, f"expected a device on a secondary bus:\n{lspci}"
+
+    devices = set(lspci.splitlines())
+
+    # A device on the root bus has no way of being taken away.
+    with pytest.raises(RuntimeError, match="not removable"):
+        vm.api.drive.delete("plain")
+
+    # The removable one goes.
+    vm.api.drive.delete("removable")
+    assert len(wait_for_pci_devices(vm, len(devices) - 1)) == len(devices) - 1
+
+    # Its port is now free for a hot-plug.
+    vm.api.drive.put(
+        drive_id="hp0",
+        path_on_host=vm.create_jailed_resource(removable.path),
+        is_root_device=False,
+        is_read_only=False,
+    )
+    wait_for_pci_devices(vm, len(devices))
