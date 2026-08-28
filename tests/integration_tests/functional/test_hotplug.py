@@ -8,8 +8,18 @@ import pytest
 
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools
-from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel, pin_pci
+from framework.artifacts import (
+    ACPI_GUEST_KERNELS,
+    pin_guest_kernel,
+    pin_hotplug_ports,
+    pin_pci,
+)
+from framework.utils import wait_for_pci_devices
 from framework.utils_cpu_templates import ALL_CPU_TEMPLATES, pin_cpu_template
+
+# Enough Root Ports for the tests that fill them all, while keeping the boot
+# cost of the ones that only need a couple small.
+HOTPLUG_PORTS = 4
 
 VIRTIO_PCI_VENDOR_ID = 0x1AF4
 VIRTIO_PCI_DEVICE_ID_NET = 0x1041
@@ -20,6 +30,7 @@ VIRTIO_PCI_DEVICE_ID_PMEM = 0x105B
 @pin_pci(True)
 @pin_cpu_template(ALL_CPU_TEMPLATES)
 @pin_guest_kernel(ACPI_GUEST_KERNELS)
+@pin_hotplug_ports(2)
 def test_hotplug_block(uvm_any):
     """
     Test hotplugging a block device after VM start.
@@ -44,12 +55,11 @@ def test_hotplug_block(uvm_any):
         },
     )
 
-    # Rescan PCI bus since no hotplug notification mechanism exists yet
-    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+    # The guest's pciehp driver discovers the device on its own.
+    after = wait_for_pci_devices(vm, len(lspci_before.splitlines()) + 1)
 
     # Verify a new virtio-block device entry appeared in lspci
-    _, lspci_after, _ = vm.ssh.check_output("lspci -n")
-    new_entries = set(lspci_after.splitlines()) - set(lspci_before.splitlines())
+    new_entries = after - set(lspci_before.splitlines())
     assert len(new_entries) == 1
     entry = new_entries.pop()
     assert f"{VIRTIO_PCI_VENDOR_ID:04x}:{VIRTIO_PCI_DEVICE_ID_BLOCK:04x}" in entry
@@ -96,9 +106,7 @@ def test_hotplug_block(uvm_any):
         )
 
     # Verify no further devices appeared after the rejected requests
-    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
-    _, lspci_final, _ = vm.ssh.check_output("lspci -n")
-    assert lspci_final == lspci_after
+    assert wait_for_pci_devices(vm, len(after)) == after
 
     # Unplugging a non-existent device must be rejected
     with pytest.raises(RuntimeError, match="Device not found"):
@@ -108,17 +116,15 @@ def test_hotplug_block(uvm_any):
     with pytest.raises(RuntimeError, match="Cannot unplug root device"):
         vm.api.drive.delete("rootfs")
 
-    # No unplug notification mechanism exists yet, so the guest needs to
-    # gracefully prepare for the detach before the host issues the unplug.
+    # Unmount for data safety, then ask for a managed removal. The guest
+    # releases the device itself, so there is no sysfs poking here.
     vm.ssh.check_output("umount /tmp/block0_mnt")
-    vm.ssh.check_output(f"echo 1 > /sys/bus/pci/devices/0000:{bdf}/remove")
-
-    # Unplug the block device
     vm.api.drive.delete("block0")
 
-    # Verify the device is gone
-    _, lspci_after_unplug, _ = vm.ssh.check_output("lspci -n")
-    assert lspci_after_unplug == lspci_before
+    # The removal completes asynchronously, once the guest has let go.
+    assert wait_for_pci_devices(vm, len(lspci_before.splitlines())) == set(
+        lspci_before.splitlines()
+    )
 
     # Unplugging the same device again must be rejected
     with pytest.raises(RuntimeError, match="Device not found"):
@@ -128,6 +134,7 @@ def test_hotplug_block(uvm_any):
 @pin_guest_kernel(ACPI_GUEST_KERNELS)
 @pin_pci(True)
 @pin_cpu_template(ALL_CPU_TEMPLATES)
+@pin_hotplug_ports(2)
 def test_hotplug_pmem(uvm_any):
     """
     Test hotplugging a pmem device after VM start.
@@ -149,12 +156,11 @@ def test_hotplug_pmem(uvm_any):
         read_only=False,
     )
 
-    # Rescan PCI bus since no hotplug notification mechanism exists yet
-    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+    # The guest's pciehp driver discovers the device on its own.
+    after = wait_for_pci_devices(vm, len(lspci_before.splitlines()) + 1)
 
     # Verify a new virtio-pmem device entry appeared in lspci
-    _, lspci_after, _ = vm.ssh.check_output("lspci -n")
-    new_entries = set(lspci_after.splitlines()) - set(lspci_before.splitlines())
+    new_entries = after - set(lspci_before.splitlines())
     assert len(new_entries) == 1
     entry = new_entries.pop()
     assert f"{VIRTIO_PCI_VENDOR_ID:04x}:{VIRTIO_PCI_DEVICE_ID_PMEM:04x}" in entry
@@ -204,25 +210,19 @@ def test_hotplug_pmem(uvm_any):
         )
 
     # Verify no further devices appeared after the rejected requests
-    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
-    _, lspci_final, _ = vm.ssh.check_output("lspci -n")
-    assert lspci_final == lspci_after
+    assert wait_for_pci_devices(vm, len(after)) == after
 
     # Unplugging a non-existent device must be rejected
     with pytest.raises(RuntimeError, match="Device not found"):
         vm.api.pmem.delete("nonexistent")
 
-    # No unplug notification mechanism exists yet, so the guest needs to
-    # gracefully prepare for the detach before the host issues the unplug.
+    # Unmount for data safety, then ask for a managed removal.
     vm.ssh.check_output("umount /tmp/pmem0_mnt")
-    vm.ssh.check_output(f"echo 1 > /sys/bus/pci/devices/0000:{bdf}/remove")
-
-    # Unplug the pmem device
     vm.api.pmem.delete("pmem0")
 
-    # Verify the device is gone
-    _, lspci_after_unplug, _ = vm.ssh.check_output("lspci -n")
-    assert lspci_after_unplug == lspci_before
+    assert wait_for_pci_devices(vm, len(lspci_before.splitlines())) == set(
+        lspci_before.splitlines()
+    )
 
     # Unplugging the same device again must be rejected
     with pytest.raises(RuntimeError, match="Device not found"):
@@ -232,6 +232,7 @@ def test_hotplug_pmem(uvm_any):
 @pin_guest_kernel(ACPI_GUEST_KERNELS)
 @pin_pci(True)
 @pin_cpu_template(ALL_CPU_TEMPLATES)
+@pin_hotplug_ports(2)
 def test_hotplug_net(uvm_any):
     """
     Test hotplugging a net device after VM start.
@@ -253,12 +254,11 @@ def test_hotplug_net(uvm_any):
         guest_mac=iface1.guest_mac,
     )
 
-    # Rescan PCI bus since no hotplug notification mechanism exists yet
-    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+    # The guest's pciehp driver discovers the device on its own.
+    after = wait_for_pci_devices(vm, len(lspci_before.splitlines()) + 1)
 
     # Verify a new net device entry appeared in lspci
-    _, lspci_after, _ = vm.ssh.check_output("lspci -n")
-    new_entries = set(lspci_after.splitlines()) - set(lspci_before.splitlines())
+    new_entries = after - set(lspci_before.splitlines())
     assert len(new_entries) == 1
     entry = new_entries.pop()
     assert f"{VIRTIO_PCI_VENDOR_ID:04x}:{VIRTIO_PCI_DEVICE_ID_NET:04x}" in entry
@@ -314,25 +314,19 @@ def test_hotplug_net(uvm_any):
         )
 
     # Verify no further devices appeared after the rejected requests
-    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
-    _, lspci_final, _ = vm.ssh.check_output("lspci -n")
-    assert lspci_final == lspci_after
+    assert wait_for_pci_devices(vm, len(after)) == after
 
     # Unplugging a non-existent device must be rejected
     with pytest.raises(RuntimeError, match="Device not found"):
         vm.api.network.delete("nonexistent")
 
-    # No unplug notification mechanism exists yet, so the guest needs to
-    # gracefully prepare for the detach before the host issues the unplug.
+    # Bring the link down for a clean stop, then ask for a managed removal.
     vm.ssh.check_output(f"ip link set {iface_name} down")
-    vm.ssh.check_output(f"echo 1 > /sys/bus/pci/devices/0000:{bdf}/remove")
-
-    # Unplug the net device
     vm.api.network.delete(iface1.dev_name)
 
-    # Verify the device is gone
-    _, lspci_after_unplug, _ = vm.ssh.check_output("lspci -n")
-    assert lspci_after_unplug == lspci_before
+    assert wait_for_pci_devices(vm, len(lspci_before.splitlines())) == set(
+        lspci_before.splitlines()
+    )
 
     # Unplugging the same device again must be rejected
     with pytest.raises(RuntimeError, match="Device not found"):
@@ -406,6 +400,7 @@ def test_hotplug_no_pci(uvm_any):
 @pin_guest_kernel(ACPI_GUEST_KERNELS)
 @pin_pci(True)
 @pin_cpu_template(ALL_CPU_TEMPLATES)
+@pin_hotplug_ports(2)
 def test_hotplug_preserved_after_snapshot(uvm_any, microvm_factory):
     """
     Test that a hotplugged device survives a full snapshot/restore cycle.
@@ -430,12 +425,12 @@ def test_hotplug_preserved_after_snapshot(uvm_any, microvm_factory):
     restored_vm = microvm_factory.build_from_snapshot(snapshot)
     restored_vm.resume()
 
-    # Rescan PCI bus since no hotplug notification mechanism exists yet
-    restored_vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
+    # The device was already in the port when the snapshot was taken, so the
+    # restored guest keeps seeing it; no rediscovery is needed.
+    after = wait_for_pci_devices(restored_vm, len(lspci_before.splitlines()) + 1)
 
     # Verify a new virtio-block device entry appeared in lspci
-    _, lspci_after, _ = restored_vm.ssh.check_output("lspci -n")
-    new_entries = set(lspci_after.splitlines()) - set(lspci_before.splitlines())
+    new_entries = after - set(lspci_before.splitlines())
     assert len(new_entries) == 1
     entry = new_entries.pop()
     assert f"{VIRTIO_PCI_VENDOR_ID:04x}:{VIRTIO_PCI_DEVICE_ID_BLOCK:04x}" in entry
@@ -458,78 +453,49 @@ def test_hotplug_preserved_after_snapshot(uvm_any, microvm_factory):
 @pin_guest_kernel(ACPI_GUEST_KERNELS)
 @pin_pci(True)
 @pin_cpu_template(ALL_CPU_TEMPLATES)
+@pin_hotplug_ports(HOTPLUG_PORTS)
 def test_hotplug_max_devices(uvm_any):
     """
-    Test that hotplugging more devices than available PCI slots is rejected.
+    Hotplugging more devices than there are Root Ports is rejected, and the
+    ports are reusable once their devices are unplugged.
     """
-    pci_max_slots = 32
     vm = uvm_any
 
-    # Count how many PCI slots are already in use
-    _, lspci_initial, _ = vm.ssh.check_output("lspci -n")
-    used_slots = len(lspci_initial.strip().splitlines())
-    free_slots = pci_max_slots - used_slots
+    _, lspci_before, _ = vm.ssh.check_output("lspci -n")
+    before = set(lspci_before.splitlines())
 
-    for i in range(free_slots):
+    def plug(drive_id):
         host_file = drive_tools.FilesystemFile(
-            os.path.join(vm.fsfiles, f"block{i}"), size=1
+            os.path.join(vm.fsfiles, drive_id), size=1
         )
         vm.api.drive.put(
-            drive_id=f"block{i}",
+            drive_id=drive_id,
             path_on_host=vm.create_jailed_resource(host_file.path),
             is_root_device=False,
             is_read_only=False,
         )
 
-    # Verify all PCI slots are occupied
-    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
-    _, lspci_full, _ = vm.ssh.check_output("lspci -n")
-    assert len(lspci_full.strip().splitlines()) == pci_max_slots
+    # Fill every port.
+    for i in range(HOTPLUG_PORTS):
+        plug(f"block{i}")
 
-    # The next hotplug must fail — no PCI slots left
-    host_file = drive_tools.FilesystemFile(
-        os.path.join(vm.fsfiles, "block_overflow"), size=1
-    )
-    with pytest.raises(
-        RuntimeError, match="Could not find an available device slot on the PCI bus"
-    ):
-        vm.api.drive.put(
-            drive_id="block_overflow",
-            path_on_host=vm.create_jailed_resource(host_file.path),
-            is_root_device=False,
-            is_read_only=False,
-        )
+    full = wait_for_pci_devices(vm, len(before) + HOTPLUG_PORTS)
+    assert len(full - before) == HOTPLUG_PORTS
 
-    # Remove the devices from the guest first
-    new_bdfs = [
-        l.split()[0]
-        for l in set(lspci_full.strip().splitlines())
-        - set(lspci_initial.strip().splitlines())
-    ]
-    for bdf in new_bdfs:
-        vm.ssh.check_output(f"echo 1 > /sys/bus/pci/devices/0000:{bdf}/remove")
+    # One more has nowhere to go.
+    with pytest.raises(RuntimeError, match="No PCIe Root Port is free"):
+        plug("block_overflow")
 
-    # Then unplug all hotplugged devices via the API
-    for i in range(free_slots):
+    # Unplug them all. These are bare devices with nothing mounted, so the
+    # guest has no reason to refuse.
+    for i in range(HOTPLUG_PORTS):
         vm.api.drive.delete(f"block{i}")
 
-    # Verify we're back to the initial number of devices
-    _, lspci, _ = vm.ssh.check_output("lspci -n")
-    assert len(lspci.strip().splitlines()) == used_slots
+    assert wait_for_pci_devices(vm, len(before)) == before
 
-    # Re-plug all devices to verify the slots were truly freed
-    for i in range(free_slots):
-        host_file = drive_tools.FilesystemFile(
-            os.path.join(vm.fsfiles, f"block_re{i}"), size=1
-        )
-        vm.api.drive.put(
-            drive_id=f"block_re{i}",
-            path_on_host=vm.create_jailed_resource(host_file.path),
-            is_root_device=False,
-            is_read_only=False,
-        )
+    # The freed ports take new devices.
+    for i in range(HOTPLUG_PORTS):
+        plug(f"block_re{i}")
 
-    # Verify all PCI slots are occupied again
-    vm.ssh.check_output("echo 1 > /sys/bus/pci/rescan")
-    _, lspci, _ = vm.ssh.check_output("lspci -n")
-    assert len(lspci.strip().splitlines()) == pci_max_slots
+    refilled = wait_for_pci_devices(vm, len(before) + HOTPLUG_PORTS)
+    assert len(refilled - before) == HOTPLUG_PORTS
