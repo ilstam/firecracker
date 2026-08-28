@@ -19,7 +19,9 @@ use vm_allocator::AllocPolicy;
 
 use crate::arch::PCI_MMCONFIG_START;
 use crate::device_manager::pci_mngr::PciManagerError;
-use crate::devices::pci::root_port::{HotplugCompletion, PciRootPort, ROOT_PORT_MSIX_BAR_SIZE};
+use crate::devices::pci::root_port::{
+    HotplugCompletion, PciRootPort, ROOT_PORT_MSIX_BAR, ROOT_PORT_MSIX_BAR_SIZE, RootPortState,
+};
 use crate::logger::info;
 use crate::pci::PciSBDF;
 #[cfg(target_arch = "x86_64")]
@@ -211,24 +213,82 @@ impl PciSegment {
                 self.hotplug_completion.clone(),
             )));
 
-            self.pci_buses
-                .root_bus()
-                .lock()
-                .expect("Poisoned lock")
-                .add_device(sbdf.device(), root_port.clone())?;
-
-            vm.common
-                .mmio_bus
-                .insert(root_port.clone(), msix_bar_addr, ROOT_PORT_MSIX_BAR_SIZE)?;
-
-            info!(
-                "pci: added PCIe Root Port: {sbdf}, secondary bus {secondary_bus}, MSI-X BAR \
-                 {msix_bar_addr:#x}"
-            );
-
-            self.root_ports.push(root_port);
+            self.attach_root_port(vm, sbdf, root_port, msix_bar_addr)?;
         }
 
+        Ok(())
+    }
+
+    /// Re-create the Root Ports of a snapshot, with the addresses and slot state
+    /// the guest already knows about.
+    pub(crate) fn restore_root_ports(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        states: &[RootPortState],
+    ) -> Result<(), PciManagerError> {
+        for state in states {
+            let root_port = Arc::new(Mutex::new(PciRootPort::from_state(
+                state,
+                vm.clone(),
+                self.hotplug_completion.clone(),
+            )?));
+
+            // The address comes from the snapshot. No allocation is needed:
+            // the whole ResourceAllocator is restored from the snapshot too, so
+            // the range is already reserved.
+            let msix_bar_addr = state.bars.get_bar_addr(ROOT_PORT_MSIX_BAR);
+
+            self.attach_root_port(vm, state.sbdf, root_port, msix_bar_addr)?;
+        }
+
+        Ok(())
+    }
+
+    /// Put a Root Port on the root bus and map its MSI-X BAR.
+    fn attach_root_port(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        sbdf: PciSBDF,
+        root_port: Arc<Mutex<PciRootPort>>,
+        msix_bar_addr: u64,
+    ) -> Result<(), PciManagerError> {
+        let secondary_bus = root_port.lock().expect("Poisoned lock").secondary_bus();
+
+        self.pci_buses
+            .root_bus()
+            .lock()
+            .expect("Poisoned lock")
+            .add_device(sbdf.device(), root_port.clone())?;
+
+        vm.common
+            .mmio_bus
+            .insert(root_port.clone(), msix_bar_addr, ROOT_PORT_MSIX_BAR_SIZE)?;
+
+        info!(
+            "pci: added PCIe Root Port: {sbdf}, secondary bus {secondary_bus}, MSI-X BAR \
+             {msix_bar_addr:#x}"
+        );
+
+        self.root_ports.push(root_port);
+        Ok(())
+    }
+
+    /// Capture the state of every Root Port.
+    pub(crate) fn root_port_states(&self) -> Vec<RootPortState> {
+        self.root_ports
+            .iter()
+            .map(|port| port.lock().expect("Poisoned lock").state())
+            .collect()
+    }
+
+    /// Enable the Root Ports' MSI-X vectors after a restore. Must run after the
+    /// GSI routes have been set up.
+    pub(crate) fn enable_unmasked_vectors(&self) -> Result<(), PciManagerError> {
+        for port in &self.root_ports {
+            port.lock()
+                .expect("Poisoned lock")
+                .enable_unmasked_vectors()?;
+        }
         Ok(())
     }
 
