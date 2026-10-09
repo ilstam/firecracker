@@ -123,7 +123,7 @@ pub const MEM_32BIT_DEVICES_SIZE: u64 = PCI_MMCONFIG_START - MEM_32BIT_DEVICES_S
 /// The start of the memory area reserved for MMIO 64-bit accesses.
 pub const MMIO64_MEM_START: u64 = 256 << 30;
 /// The size of the memory area reserved for MMIO 64-bit accesses.
-pub const MMIO64_MEM_SIZE: u64 = 256 << 30;
+pub const MMIO64_MEM_SIZE: u64 = 128 << 30;
 
 // At the moment, all of this region goes to devices
 /// Beginning of memory region for device MMIO 64-bit accesses
