@@ -6,8 +6,12 @@ import ipaddress
 import os
 import random
 import re
+import select
 import signal
 import string
+import subprocess
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,6 +19,26 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 
 from framework import utils
 from framework.utils import Timeout
+
+
+def read_line(proc, deadline, what):
+    """Read one line from `proc`'s stdout, or raise once `deadline` passes.
+
+    `deadline` is a time.monotonic() value. The line is read a byte at a
+    time so that nothing past its newline is consumed.
+    """
+    fd = proc.stdout.fileno()
+    line = b""
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            raise TimeoutError(f"No {what} arrived in time")
+        char = os.read(fd, 1)
+        if not char:
+            raise ChildProcessError("The guest closed the ssh session")
+        if char == b"\n":
+            return line
+        line += char
 
 
 class SSHConnection:
@@ -214,6 +238,70 @@ class SSHConnection:
     def check_output(self, cmd_string, timeout=100, *, debug=False):
         """Same as `run`, but raises an exception on non-zero return code of remote command"""
         return self.run(cmd_string, timeout, check=True, debug=debug)
+
+    @contextmanager
+    def _guest_session(self, remote_cmd):
+        """Hold one ssh session open running `remote_cmd`, and yield it.
+
+        The pipes are binary and unbuffered: a text wrapper may read ahead,
+        which would leave select() on the fd disagreeing with what Python
+        has already buffered.
+        """
+        cmd = ["ssh", *self.options, self.user_host, remote_cmd]
+        if self.netns is not None:
+            cmd = ["ip", "netns", "exec", self.netns] + cmd
+
+        # pylint: disable=consider-using-with
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0
+        )
+        try:
+            yield proc
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    @contextmanager
+    def probe_channel(self, timeout=10):
+        """Hold a single ssh session open for cheap repeated yes/no probes.
+
+        Yields a callable returning the truth of a remote command. Remote
+        output is discarded, so prefer a shell builtin such as
+        `[ -e /some/path ]` to avoid spawning a guest process per probe.
+
+        Pass `wait=False` to fire a command off without reading its reply,
+        for when that round trip would land inside something being timed.
+        The reply is then left unread, so no further probe may follow.
+        """
+        # One request per line in, one OK/NO per request out. Remote output is
+        # dropped so a chatty command cannot desynchronise the reply stream.
+        loop = (
+            "while IFS= read -r __probe; do "
+            'if eval "$__probe" >/dev/null 2>&1; then echo OK; else echo NO; fi; '
+            "done"
+        )
+
+        with self._guest_session(loop) as proc:
+
+            def probe(cmd_string, wait=True):
+                proc.stdin.write(cmd_string.encode() + b"\n")
+                if not wait:
+                    return None
+
+                deadline = time.monotonic() + timeout
+                while True:
+                    line = read_line(proc, deadline, "probe reply")
+                    if line in (b"OK", b"NO"):
+                        return line == b"OK"
+                    # Anything else is noise, e.g. an ssh warning. Drop it.
+
+            # Fail here rather than inside a caller's timing loop.
+            assert probe(":"), "Probe channel did not come up"
+            yield probe
 
     def _exec(self, cmd, timeout=100, check=False):
         """Private function that handles the ssh client invocation."""
