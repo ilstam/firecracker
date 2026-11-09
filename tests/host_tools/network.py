@@ -20,6 +20,11 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 from framework import utils
 from framework.utils import Timeout
 
+# e.g. `KERNEL[82.906] bind /devices/pci0000:00/0000:00:00.0/0000:01:00.0 (pci)`
+UEVENT_RE = re.compile(
+    r"^KERNEL\[[\d.]+\]\s+(?P<action>\S+)\s+(?P<devpath>\S+)\s+\((?P<subsystem>\S+)\)"
+)
+
 
 def read_line(proc, deadline, what):
     """Read one line from `proc`'s stdout, or raise once `deadline` passes.
@@ -302,6 +307,44 @@ class SSHConnection:
             # Fail here rather than inside a caller's timing loop.
             assert probe(":"), "Probe channel did not come up"
             yield probe
+
+    @contextmanager
+    def uevent_monitor(self, subsystem, sync_device, timeout=10):
+        """Stream one subsystem's guest kernel uevents over an ssh session.
+
+        Yields a callable blocking until an event with the given action
+        arrives, and returning its device path. This times a guest-side
+        transition without polling for it, so with no sampling interval to
+        quantise the result and nothing running in the guest meanwhile.
+
+        `sync_device` is the sysfs directory of a device that is already
+        present. A synthetic event on it proves the stream is live, which
+        the monitor's own header does not: udevadm prints that before
+        binding the netlink socket, so a fast event could be missed.
+        """
+        monitor = f"udevadm monitor --kernel --subsystem-match={subsystem}"
+
+        with self._guest_session(monitor) as proc:
+
+            def wait_for_action(action, wait=timeout):
+                deadline = time.monotonic() + wait
+                while True:
+                    line = read_line(proc, deadline, f"{action} uevent")
+                    match = UEVENT_RE.match(line.decode(errors="replace"))
+                    if match and match.group("action") == action:
+                        return match.group("devpath")
+
+            deadline = time.monotonic() + timeout
+            while True:
+                self.check_output(f"echo change > {sync_device}/uevent")
+                try:
+                    wait_for_action("change", wait=0.5)
+                    break
+                except TimeoutError:
+                    if time.monotonic() > deadline:
+                        raise
+
+            yield wait_for_action
 
     def _exec(self, cmd, timeout=100, check=False):
         """Private function that handles the ssh client invocation."""
